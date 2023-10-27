@@ -2,6 +2,23 @@
 
 struct net_device *ctem_dev;
 
+static int setup_sock_addr(struct sockaddr** addr,int port);
+
+static int setup_sock_addr(struct sockaddr** addr,int port)
+{
+    struct sockaddr_in *udp_addr = kmalloc(sizeof(struct sockaddr_in),GFP_KERNEL);
+
+    if (udp_addr == NULL) return -ENOMEM;
+
+    memset(udp_addr, 0, sizeof(struct sockaddr_in));
+    udp_addr->sin_family = PF_INET;
+    udp_addr->sin_port = htons(port);
+    udp_addr->sin_addr.s_addr = htonl(INADDR_ANY);
+    *addr = (struct sockaddr*)udp_addr;
+
+    return 0;
+}
+
 static int ctem_open(struct net_device *dev)
 {   
     printk(KERN_INFO "%s: Opened %s\n",MODULE_NAME, dev->name);
@@ -28,7 +45,6 @@ static int ctem_packet_reception_thread(void *arg)
 {
     struct net_device *dev = (struct net_device*) arg;
     struct ctem_priv *priv = netdev_priv(dev);
-    char receive_buffer[20];
 
     printk(KERN_DEBUG "%s: Started listing\n", MODULE_NAME); 
 
@@ -36,20 +52,19 @@ static int ctem_packet_reception_thread(void *arg)
     {
         struct msghdr msg;
         struct sockaddr_in sender_addr;
-        struct kvec iov;       
+        struct kvec iov;
+        struct can_frame can_frame;       
         int ret;
         
         // initalize structs
         memset(&sender_addr, 0, sizeof(sender_addr));
         memset(&msg, 0, sizeof(msg));
         memset(&iov, 0, sizeof(iov));
-
-        // clear buffer
-        memset(receive_buffer, 0, sizeof(receive_buffer));
+        memset(&can_frame, 0, sizeof(can_frame));
 
         // set up iov struct
-        iov.iov_base = receive_buffer;
-        iov.iov_len = sizeof(receive_buffer);
+        iov.iov_base = &can_frame;
+        iov.iov_len = sizeof(struct can_frame);
 
         ret = kernel_recvmsg(priv->udp_socket, &msg, &iov, 1, iov.iov_len, MSG_WAITALL);
         if (ret < 0)
@@ -59,8 +74,7 @@ static int ctem_packet_reception_thread(void *arg)
         else
         {
             if(printk_ratelimit()){                
-                printk(KERN_DEBUG "%s: Received %d Bytes: %x %x %x %x %x\n", MODULE_NAME, ret, receive_buffer[0],receive_buffer[1],receive_buffer[2],receive_buffer[3],receive_buffer[4]);   
-                // printk(KERN_DEBUG "%s: Received %d Bytes: ID: %x, DLC: %d, Data: %x %x %x %x %x %x %x %x\n", MODULE_NAME, ret, frame.can_id, frame.can_dlc, frame.data[0], frame.data[1], frame.data[2], frame.data[3], frame.data[4], frame.data[5], frame.data[6], frame.data[7]);     
+                printk(KERN_DEBUG "%s: Received %d Bytes\nCAN frame - ID: %x, DLC: %d, Data: %x %x %x %x %x %x %x %x\n", MODULE_NAME, ret, can_frame.can_id, can_frame.can_dlc, can_frame.data[0], can_frame.data[1], can_frame.data[2], can_frame.data[3], can_frame.data[4], can_frame.data[5], can_frame.data[6], can_frame.data[7]);     
             }
         }
     }
@@ -76,20 +90,34 @@ static void ctem_start_udp(struct net_device *dev)
     (void)wake_up_process(priv->udp_thread);
 }
 
-static int ctem_setup_udp(struct net_device *dev,struct sockaddr_in *udp_addr)
+static int ctem_setup_udp(struct net_device *dev, int udp_listen_port, int udp_send_port)
 {
     int ret;
     struct ctem_priv *priv = netdev_priv(dev);
 
+    ret = setup_sock_addr(&priv->udp_addr_listen, udp_listen_port);
+    if(ret)
+    {
+        printk(KERN_ERR "%s: Error setting up udp listen addr\n", MODULE_NAME);
+        return ret;
+    }
+
+    ret = setup_sock_addr(&priv->udp_addr_send, udp_send_port);
+    if(ret)
+    {
+        printk(KERN_ERR "%s: Error setting up udp send addr\n", MODULE_NAME);
+        return ret;
+    }
+
     // set up UDP socket
     ret = sock_create_kern(&init_net, PF_INET, SOCK_DGRAM, IPPROTO_UDP,&(priv->udp_socket));
     if (ret) {
-        printk(KERN_ERR "Error creating UDP socket: %d\n", ret);
+        printk(KERN_ERR "%s: Error creating UDP socket: %d\n", MODULE_NAME, ret);
         return ret;
     }
 
     // bind UDP socket to udp_addr
-    ret = kernel_bind(priv->udp_socket, (struct sockaddr*)udp_addr, sizeof((*udp_addr)));
+    ret = kernel_bind(priv->udp_socket, priv->udp_addr_listen, sizeof(*(priv->udp_addr_listen)));
     if(ret){
         printk(KERN_ERR "%s: Error binding UDP socket: %d\n", MODULE_NAME, ret);
         return ret;
@@ -113,6 +141,10 @@ static void ctem_teardown_udp(struct net_device *dev)
         sock_release(priv->udp_socket);
     if(priv->udp_thread != NULL)
         (void)kthread_stop(priv->udp_thread);
+    if(priv->udp_addr_listen != NULL)
+        kfree(priv->udp_addr_listen);
+    if(priv->udp_addr_send != NULL)
+        kfree(priv->udp_addr_send);
 }
 
 void ctem_init(struct net_device *dev)
@@ -137,7 +169,9 @@ void ctem_init(struct net_device *dev)
     memset(priv, 0, sizeof(struct ctem_priv));
     priv->dev = dev;
     priv->udp_socket = NULL;
-    priv->udp_thread = NULL;    
+    priv->udp_thread = NULL;   
+    priv->udp_addr_listen = NULL;
+    priv->udp_addr_send = NULL; 
 }
 
 static __exit void ctem_cleanup_module(void)
@@ -161,16 +195,9 @@ static __init int ctem_init_module(void)
         printk(KERN_ERR "%s: Failed to allocate device\n",MODULE_NAME);
         goto out_alloc;
     }
-    printk(KERN_DEBUG "%s: Allocated device.\n",MODULE_NAME);   
+    printk(KERN_DEBUG "%s: Allocated device.\n",MODULE_NAME);    
 
-    // setup udp
-    struct sockaddr_in udp_addr;
-    memset(&udp_addr, 0, sizeof(udp_addr));
-    udp_addr.sin_family = PF_INET;
-    udp_addr.sin_port = htons(1069);  // Local port
-    udp_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-
-    ret = ctem_setup_udp(ctem_dev,&udp_addr);
+    ret = ctem_setup_udp(ctem_dev,1069,1069);
     if (ret)
     {
         printk(KERN_ERR "%s: Failed to setup udp\n", MODULE_NAME);

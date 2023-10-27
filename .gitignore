@@ -5,3 +5,5 @@
 *.symvers
 *.order
 .vscode/**
+*.d
+*.mod.*

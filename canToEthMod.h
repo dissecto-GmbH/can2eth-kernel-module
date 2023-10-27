@@ -18,6 +18,8 @@ struct ctem_priv {
     struct net_device *dev;
     struct socket *udp_socket;
     struct task_struct *udp_thread;
+    struct sockaddr *udp_addr_listen;
+    struct sockaddr *udp_addr_send;
 };
 
 static int ctem_open(struct net_device *dev);
@@ -32,7 +34,7 @@ static const struct net_device_ops ctem_netdev_ops = {
 
 void ctem_init(struct net_device *dev);
 static void ctem_start_udp(struct net_device *dev);
-static int ctem_setup_udp(struct net_device *dev,struct sockaddr_in *udp_addr);
+static int ctem_setup_udp(struct net_device *dev, int udp_listen_port, int udp_send_port);
 static void ctem_teardown_udp(struct net_device *dev);
 
 static int ctem_packet_reception_thread(void *arg);
