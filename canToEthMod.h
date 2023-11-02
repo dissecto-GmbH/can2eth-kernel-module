@@ -14,12 +14,26 @@
 #include <linux/kernel.h>
 #include <linux/kthread.h>
 #include <linux/module.h>
+#include <linux/moduleparam.h>
+#include <linux/net.h>
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
 #include <linux/socket.h>
 #include <net/rtnetlink.h>
 
+#include <linux/types.h>
+
 #define MODULE_NAME "CanToEth"
+
+static char *udp_dest_ip_str;
+static int udp_dest_port = 1070;
+static int udp_src_port = 1070;
+
+extern struct net_device *ctem_dev;
+
+module_param(udp_dest_ip_str, charp, S_IRUGO);
+module_param(udp_dest_port, int, S_IRUGO);
+module_param(udp_src_port, int, S_IRUGO);
 
 struct ctem_priv
 {
@@ -27,24 +41,23 @@ struct ctem_priv
     struct net_device *dev;
     struct socket *udp_socket;
     struct task_struct *udp_thread;
-    struct sockaddr *udp_addr_listen;
-    struct sockaddr *udp_addr_send;
-    int bitrate;
+    struct sockaddr *udp_addr_src; // socket is listing to this
+    struct sockaddr *udp_addr_dst; // sending packets here
 };
 
 static const struct ethtool_ops ctem_ethtool_ops = {
     .get_ts_info = ethtool_op_get_ts_info,
 };
 
-static void ctem_setup(struct net_device *dev);
-static void ctem_dellink(struct net_device *dev, struct list_head *head);
+// static void ctem_setup(struct net_device *dev);
+// static void ctem_dellink(struct net_device *dev, struct list_head *head);
 
-static struct rtnl_link_ops ctem_link_ops __read_mostly = {
-    .kind = MODULE_NAME,
-    .priv_size = sizeof(struct ctem_priv) + sizeof(struct can_ml_priv),
-    .setup = ctem_setup,
-    .dellink = ctem_dellink,
-};
+// static struct rtnl_link_ops ctem_link_ops __read_mostly = {
+//     .kind = MODULE_NAME,
+//     .priv_size = sizeof(struct ctem_priv) + sizeof(struct can_ml_priv),
+//     .setup = ctem_setup,
+//     .dellink = ctem_dellink,
+// };
 
 static int ctem_open(struct net_device *dev);
 static int ctem_stop(struct net_device *dev);
@@ -62,7 +75,7 @@ static const struct net_device_ops ctem_netdev_ops = {
 
 static void ctem_init(struct net_device *dev);
 static void ctem_start_udp(struct net_device *dev);
-static int ctem_setup_udp(struct net_device *dev, int udp_listen_port, int udp_send_port);
+static int ctem_setup_udp(struct net_device *dev, u32 dest_addr, int dest_port, int src_port);
 static void ctem_teardown_udp(struct net_device *dev);
 
 static int ctem_packet_reception_thread(void *arg);
