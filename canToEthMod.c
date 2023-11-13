@@ -20,20 +20,6 @@ static int setup_sock_addr(struct sockaddr **addr, int port, u32 ip)
     return 0;
 }
 
-// static void ctem_dellink(struct net_device *dev, struct list_head *head)
-// {
-//     struct ctem_priv *priv = netdev_priv(dev);
-
-//     printk(KERN_DEBUG "%s: dellink\n", MODULE_NAME);
-
-//     ctem_teardown_udp(dev);
-//     kfree(priv->stats);
-
-//     dev->flags |= IFF_DORMANT;
-
-//     unregister_netdevice_queue(dev, NULL);
-// }
-
 static struct net_device_stats *ctem_get_stats(struct net_device *dev)
 {
     struct rtnl_link_stats64 stats64;
@@ -177,7 +163,7 @@ static int ctem_packet_reception_thread(void *arg)
         struct msghdr msg;
         struct sockaddr_in sender_addr;
         struct kvec iov;
-        unsigned char receive_buffer[sizeof(struct can_frame)];
+        unsigned char receive_buffer[2000];
         int ret;
 
         // initalize structs
@@ -202,7 +188,10 @@ static int ctem_packet_reception_thread(void *arg)
             /*
              * TODO: Use workqueue here
              */
-            ctem_parse_frame(dev, receive_buffer, sizeof(receive_buffer));
+            if (printk_ratelimit())
+                printk(KERN_DEBUG "%s: Received %d Bytes.\n", MODULE_NAME, ret);
+
+            // ctem_parse_frame(dev, receive_buffer, sizeof(receive_buffer));
         }
     }
 
@@ -236,7 +225,7 @@ static int ctem_setup_udp(struct net_device *dev, u32 udp_dest_addr, int dest_po
         printk(KERN_ERR "%s: Error setting up udp send addr %u:%d\n", MODULE_NAME, udp_dest_addr, dest_port);
         return ret;
     }
-    printk(KERN_DEBUG "%s: sending to udp %u:%d", MODULE_NAME, udp_dest_addr, src_port);
+    printk(KERN_DEBUG "%s: sending to udp %u:%d", MODULE_NAME, udp_dest_addr, dest_port);
 
     // set up UDP socket
     ret = sock_create_kern(&init_net, PF_INET, SOCK_DGRAM, IPPROTO_UDP, &(priv->udp_socket));
@@ -318,26 +307,9 @@ static void ctem_init(struct net_device *dev)
     can_set_ml_priv(dev, can_ml);
 }
 
-// static void ctem_setup(struct net_device *dev)
-// {
-//     int ret;
-
-//     ctem_init(dev);
-
-//     ret = ctem_setup_udp(dev, param_daddr, 1069, 1069);
-//     if (ret)
-//     {
-//         printk(KERN_ERR "%s: Failed to setup udp\n", MODULE_NAME);
-//     }
-
-//     ctem_start_udp(dev);
-// }
-
 static __exit void ctem_cleanup_module(void)
 {
     printk(KERN_DEBUG "%s: Unregistering CAN to Eth Driver\n", MODULE_NAME);
-
-    // rtnl_link_unregister(&ctem_link_ops);
 
     ctem_teardown_udp(ctem_dev);
 
@@ -347,21 +319,21 @@ static __exit void ctem_cleanup_module(void)
 static __init int ctem_init_module(void)
 {
     int ret;
+    u32 dest_addr = INADDR_ANY;
 
     printk(KERN_DEBUG "%s: Registering CAN to Eth Driver\n", MODULE_NAME);
 
     if (udp_dest_ip_str == NULL || strlen(udp_dest_ip_str) == 0)
+        printk(KERN_WARNING "%s: No ip dest addr specified\n", MODULE_NAME);
+    else
     {
-        printk(KERN_ERR "%s: No or invalid ip dest addr given\n", MODULE_NAME);
-        return -EINVAL;
+        printk(KERN_DEBUG "%s: Loaded with ip dest addr: %s\n", MODULE_NAME, udp_dest_ip_str);
+        dest_addr = in_aton(udp_dest_ip_str);
     }
-    printk(KERN_DEBUG "%s: Loaded with ip dest addr: %s\n", MODULE_NAME, udp_dest_ip_str);
-
-    // return rtnl_link_register(&ctem_link_ops);
 
     ctem_dev = alloc_netdev(sizeof(struct ctem_priv), "can%d", NET_NAME_UNKNOWN, ctem_init);
 
-    ret = ctem_setup_udp(ctem_dev, in_aton(udp_dest_ip_str), udp_dest_port, udp_src_port);
+    ret = ctem_setup_udp(ctem_dev, dest_addr, udp_dest_port, udp_src_port);
     if (ret)
     {
         printk(KERN_ERR "%s: Failed to setup udp\n", MODULE_NAME);

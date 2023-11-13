@@ -21,13 +21,11 @@
 #include <linux/socket.h>
 #include <net/rtnetlink.h>
 
-#include <linux/types.h>
-
 #define MODULE_NAME "CanToEth"
 
 static char *udp_dest_ip_str;
-static int udp_dest_port = 1070;
-static int udp_src_port = 1070;
+static int udp_dest_port = 8765;
+static int udp_src_port = 8765;
 
 extern struct net_device *ctem_dev;
 
@@ -48,16 +46,6 @@ struct ctem_priv
 static const struct ethtool_ops ctem_ethtool_ops = {
     .get_ts_info = ethtool_op_get_ts_info,
 };
-
-// static void ctem_setup(struct net_device *dev);
-// static void ctem_dellink(struct net_device *dev, struct list_head *head);
-
-// static struct rtnl_link_ops ctem_link_ops __read_mostly = {
-//     .kind = MODULE_NAME,
-//     .priv_size = sizeof(struct ctem_priv) + sizeof(struct can_ml_priv),
-//     .setup = ctem_setup,
-//     .dellink = ctem_dellink,
-// };
 
 static int ctem_open(struct net_device *dev);
 static int ctem_stop(struct net_device *dev);
