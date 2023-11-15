@@ -2,9 +2,11 @@
 #define _CAN_TO_ETH_MOD_H
 
 #include <linux/can.h>
-#include <linux/can/core.h>
 #include <linux/can/can-ml.h>
+#include <linux/can/dev.h>
 #include <linux/can/raw.h>
+#include <linux/can/rx-offload.h>
+#include <linux/can/skb.h>
 #include <linux/errno.h>
 #include <linux/ethtool.h>
 #include <linux/if_arp.h>
@@ -19,9 +21,15 @@
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
 #include <linux/socket.h>
+#include <linux/time.h>
+#include <linux/time64.h>
+#include <linux/types.h>
+
 #include <net/rtnetlink.h>
 
 #define MODULE_NAME "CanToEth"
+#define CTEM_BUFFER_SIZE 2000
+#define CTEM_NAPI_WEIGHT 4
 
 static char *udp_dest_ip_str;
 static int udp_dest_port = 8765;
@@ -33,8 +41,32 @@ module_param(udp_dest_ip_str, charp, S_IRUGO);
 module_param(udp_dest_port, int, S_IRUGO);
 module_param(udp_src_port, int, S_IRUGO);
 
+struct can2eth_pkthdr
+{
+    uint32_t magic;
+    uint32_t tv_sec;
+    uint32_t tv_nsec;
+    uint16_t seqno;
+    uint16_t size;
+};
+
+struct can2eth_can_chunk
+{
+    uint32_t tv_sec;
+    uint32_t tv_nsec;
+    uint32_t can_id; /* 32 bit CAN_ID + EFF/RTR/ERR flags */
+    uint8_t interface_idx;
+    uint8_t reserved;
+    uint8_t len;   /* frame payload length in byte (0 .. 64) */
+    uint8_t flags; /* additional flags for CAN FD */
+    uint8_t data[64] __attribute__((aligned(8)));
+};
+
 struct ctem_priv
 {
+    /* Apparently this must be the first member when using alloc_candev() */
+    struct can_priv can;
+    struct can_rx_offload offload;
     struct rtnl_link_stats64 *stats;
     struct net_device *dev;
     struct socket *udp_socket;
@@ -67,7 +99,7 @@ static int ctem_setup_udp(struct net_device *dev, u32 dest_addr, int dest_port, 
 static void ctem_teardown_udp(struct net_device *dev);
 
 static int ctem_packet_reception_thread(void *arg);
-static void ctem_parse_frame(struct net_device *dev, unsigned char *buf, int size);
+static int ctem_parse_frame(struct net_device *dev, void *buf, size_t size);
 
 static __exit void ctem_cleanup_module(void);
 static __init int ctem_init_module(void);

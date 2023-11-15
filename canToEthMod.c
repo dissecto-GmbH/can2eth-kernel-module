@@ -47,12 +47,26 @@ static void ctem_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *s
 
     printk(KERN_DEBUG "%s: Get Stats64\n", MODULE_NAME);
 
-    memcpy(priv->stats, storage, sizeof(struct rtnl_link_stats64));
+    memcpy(storage, priv->stats, sizeof(struct rtnl_link_stats64));
 }
 
 static int ctem_open(struct net_device *dev)
 {
-    printk(KERN_INFO "%s: Opened %s\n", MODULE_NAME, dev->name);
+    struct ctem_priv *priv = netdev_priv(dev);
+    int err;
+
+    printk(KERN_DEBUG "%s: Opened %s\n", MODULE_NAME, dev->name);
+
+    err = can_rx_offload_add_manual(dev, &priv->offload, CTEM_NAPI_WEIGHT);
+    if (err)
+    {
+        close_candev(dev);
+        return err;
+    }
+
+    can_rx_offload_enable(&priv->offload);
+
+    priv->can.state = CAN_STATE_ERROR_ACTIVE;
 
     netif_carrier_on(dev);
     netif_start_queue(dev);
@@ -61,10 +75,18 @@ static int ctem_open(struct net_device *dev)
 
 static int ctem_stop(struct net_device *dev)
 {
-    printk(KERN_INFO "%s: Stopped %s\n", MODULE_NAME, dev->name);
+    struct ctem_priv *priv = netdev_priv(dev);
+
+    printk(KERN_DEBUG "%s: Stopped %s\n", MODULE_NAME, dev->name);
 
     netif_carrier_off(dev);
     netif_stop_queue(dev);
+
+    can_rx_offload_disable(&priv->offload);
+    priv->can.state = CAN_STATE_STOPPED;
+    can_rx_offload_del(&priv->offload);
+    close_candev(dev);
+
     return 0;
 }
 
@@ -113,42 +135,136 @@ static netdev_tx_t ctem_xmit(struct sk_buff *skb, struct net_device *dev)
     return NETDEV_TX_OK;
 }
 
-static void ctem_parse_frame(struct net_device *dev, unsigned char *buf, int size)
+static int ctem_parse_frame(struct net_device *dev, void *buf, size_t sz)
 {
-    struct can_frame *can_frame;
-    struct sk_buff *skb;
     struct ctem_priv *priv = netdev_priv(dev);
-    int ret;
+    struct timespec64 ts;
+    struct can2eth_pkthdr *hdr = (struct can2eth_pkthdr *)buf;
+    int16_t size = htons(hdr->size);
 
-    skb = netdev_alloc_skb(dev, sizeof(struct can_frame));
-
-    if (skb)
+    if (sz < sizeof(struct can2eth_pkthdr))
     {
-        can_frame = (struct can_frame *)skb_put(skb, sizeof(struct can_frame));
+        printk(KERN_ERR "%s: received datagram was too short to be a can2eth packet.\n", MODULE_NAME);
+        return -1;
+    }
 
-        can_frame->can_id = (buf[2] << 8) | buf[3];
-        can_frame->len = buf[4];
-        memcpy(can_frame->data, &buf[8], can_frame->len);
+    if (htonl(hdr->magic) != 0x43324547)
+    {
+        printk(KERN_ERR "%s: received datagram does not have can2eth magic number.\n", MODULE_NAME);
+        return -2;
+    }
 
-        skb->dev = dev;
-        skb->protocol = htons(ETH_P_CAN);
-        skb->ip_summed = CHECKSUM_UNNECESSARY;
+    if (sz < size)
+    {
+        printk(KERN_ERR "%s: received datagram is shorter than what declared in the can2eth header.\n", MODULE_NAME);
+        return -3;
+    }
 
-        ret = netif_rx(skb);
+    ts.tv_sec = htonl(hdr->tv_sec);
+    ts.tv_nsec = htonl(hdr->tv_nsec);
+    buf += sizeof(struct can2eth_pkthdr);
+    sz -= sizeof(struct can2eth_pkthdr);
 
-        // update stats
-        if (ret == NET_RX_DROP)
-            priv->stats->rx_dropped++;
-        else if (ret == NET_RX_SUCCESS)
+    for (unsigned chunk_idx = 0; sz > 4; chunk_idx++)
+    {
+        uint16_t chunk_size = htons(((uint16_t *)buf)[0]);
+        uint16_t chunk_type = htons(((uint16_t *)buf)[1]);
+        sz -= 4;
+        buf += 4;
+        if (sz < chunk_size)
         {
-            priv->stats->rx_bytes += can_frame->len;
-            priv->stats->rx_packets++;
+            printk(KERN_ERR "%s: a chunk in the received datagram is cut short. %d %u\n", MODULE_NAME, size, chunk_size);
+            return -5;
         }
+
+        switch (chunk_type)
+        {
+        case 0xc0fe:
+        {
+            struct can2eth_can_chunk *can_chunk = (struct can2eth_can_chunk *)(buf);
+            struct timespec64 ts;
+            uint32_t can_id = htonl(can_chunk->can_id);
+            uint8_t len = can_chunk->len;
+            uint8_t data[64];
+            struct sk_buff *skb;
+            int ret;
+
+            ts.tv_sec = htonl(can_chunk->tv_sec);
+            ts.tv_nsec = htonl(can_chunk->tv_nsec);
+
+            priv->stats->rx_bytes += can_chunk->len;
+            priv->stats->rx_packets++;
+
+            if (len + offsetof(struct can2eth_can_chunk, data) != chunk_size)
+            {
+                printk(KERN_WARNING "%s: can chunk size is unexpected (16+%u / %u)\n", MODULE_NAME, len, chunk_size);
+                break;
+            }
+            memcpy(data, can_chunk->data, len);
+            if (can_id & 0x80000000)
+            {
+                // canfd frames
+                struct canfd_frame *frame;
+
+                skb = alloc_canfd_skb(dev, &frame);
+                if (!skb)
+                {
+                    printk(KERN_ERR "%s: Failed to allocate ksb for CANFD frame\n", MODULE_NAME);
+                    return -ENOMEM;
+                }
+
+                frame->can_id = htonl(can_chunk->can_id);
+                frame->len = can_chunk->len;
+                frame->flags = can_chunk->flags;
+                for (unsigned i = 0; i < frame->len; i++)
+                {
+                    frame->data[i] = can_chunk->data[i];
+                }
+            }
+            else
+            {
+                // can frames
+                struct can_frame *frame;
+
+                skb = alloc_can_skb(dev, &frame);
+                if (!skb)
+                {
+                    printk(KERN_ERR "%s: Failed to allocate ksb for CAN frame\n", MODULE_NAME);
+                    return -ENOMEM;
+                }
+                frame->can_id = htonl(can_chunk->can_id);
+                frame->len = can_chunk->len;
+                for (unsigned i = 0; i < frame->len; i++)
+                {
+                    frame->data[i] = can_chunk->data[i];
+                }
+            }
+
+            ret = can_rx_offload_queue_tail(&priv->offload, skb);
+            if (ret)
+                priv->stats->rx_errors++;
+            can_rx_offload_irq_finish(&priv->offload);
+
+            break;
+        }
+        default:
+        {
+            printk(KERN_WARNING "%s: warning: unknown chunk type 0x%04x.\n", MODULE_NAME, chunk_type);
+            break;
+        }
+        }
+
+        sz -= chunk_size;
+        buf += chunk_size;
     }
-    else
+
+    if (sz > 0)
     {
-        priv->stats->rx_errors++;
+        printk(KERN_ERR "%s: datagram has %lu leftover bytes.\n", MODULE_NAME, sz);
+        return -4;
     }
+
+    return NET_RX_SUCCESS;
 }
 
 static int ctem_packet_reception_thread(void *arg)
@@ -163,13 +279,14 @@ static int ctem_packet_reception_thread(void *arg)
         struct msghdr msg;
         struct sockaddr_in sender_addr;
         struct kvec iov;
-        unsigned char receive_buffer[2000];
+        unsigned char receive_buffer[CTEM_BUFFER_SIZE];
         int ret;
 
         // initalize structs
         memset(&sender_addr, 0, sizeof(sender_addr));
         memset(&msg, 0, sizeof(msg));
         memset(&iov, 0, sizeof(iov));
+        memset(receive_buffer, 0, sizeof(receive_buffer));
 
         // set up iov struct
         iov.iov_base = receive_buffer;
@@ -185,13 +302,17 @@ static int ctem_packet_reception_thread(void *arg)
         }
         else
         {
+            int err;
             /*
              * TODO: Use workqueue here
              */
             if (printk_ratelimit())
                 printk(KERN_DEBUG "%s: Received %d Bytes.\n", MODULE_NAME, ret);
 
-            // ctem_parse_frame(dev, receive_buffer, sizeof(receive_buffer));
+            /*
+             * TODO: Handle return value
+             */
+            err = ctem_parse_frame(dev, receive_buffer, ret);
         }
     }
 
@@ -271,7 +392,6 @@ static void ctem_teardown_udp(struct net_device *dev)
 static void ctem_init(struct net_device *dev)
 {
     struct ctem_priv *priv;
-    struct can_ml_priv *can_ml;
 
     dev->type = ARPHRD_CAN;
     dev->mtu = CAN_MTU;
@@ -301,10 +421,6 @@ static void ctem_init(struct net_device *dev)
     // initialize stats struct
     priv->stats = kmalloc(sizeof(struct rtnl_link_stats64), GFP_KERNEL);
     memset(priv->stats, 0, sizeof(struct rtnl_link_stats64));
-
-    // set can middle layer priv data
-    can_ml = (void *)priv + ALIGN(sizeof(*priv), NETDEV_ALIGN);
-    can_set_ml_priv(dev, can_ml);
 }
 
 static __exit void ctem_cleanup_module(void)
@@ -331,7 +447,9 @@ static __init int ctem_init_module(void)
         dest_addr = in_aton(udp_dest_ip_str);
     }
 
-    ctem_dev = alloc_netdev(sizeof(struct ctem_priv), "can%d", NET_NAME_UNKNOWN, ctem_init);
+    ctem_dev = alloc_candev(sizeof(struct ctem_priv), 0);
+
+    ctem_init(ctem_dev);
 
     ret = ctem_setup_udp(ctem_dev, dest_addr, udp_dest_port, udp_src_port);
     if (ret)
@@ -343,7 +461,14 @@ static __init int ctem_init_module(void)
 
     ctem_start_udp(ctem_dev);
 
-    return register_netdev(ctem_dev);
+    ret = register_candev(ctem_dev);
+    if (ret)
+    {
+        free_candev(ctem_dev);
+        return ret;
+    }
+
+    return 0;
 }
 
 module_init(ctem_init_module);
