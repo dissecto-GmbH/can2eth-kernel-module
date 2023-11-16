@@ -138,7 +138,7 @@ static netdev_tx_t ctem_xmit(struct sk_buff *skb, struct net_device *dev)
 static int ctem_parse_frame(struct net_device *dev, void *buf, size_t sz)
 {
     struct ctem_priv *priv = netdev_priv(dev);
-    struct timespec64 ts;
+    struct timespec64 hdr_ts;
     struct can2eth_pkthdr *hdr = (struct can2eth_pkthdr *)buf;
     int16_t size = htons(hdr->size);
 
@@ -160,8 +160,8 @@ static int ctem_parse_frame(struct net_device *dev, void *buf, size_t sz)
         return -3;
     }
 
-    ts.tv_sec = htonl(hdr->tv_sec);
-    ts.tv_nsec = htonl(hdr->tv_nsec);
+    hdr_ts.tv_sec = htonl(hdr->tv_sec);
+    hdr_ts.tv_nsec = htonl(hdr->tv_nsec);
     buf += sizeof(struct can2eth_pkthdr);
     sz -= sizeof(struct can2eth_pkthdr);
 
@@ -239,6 +239,9 @@ static int ctem_parse_frame(struct net_device *dev, void *buf, size_t sz)
                     frame->data[i] = can_chunk->data[i];
                 }
             }
+
+            // set skb timestamp to timestamp from chunk
+            skb->tstamp = timespec64_to_ktime(ts);
 
             ret = can_rx_offload_queue_tail(&priv->offload, skb);
             if (ret)
