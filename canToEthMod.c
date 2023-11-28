@@ -3,6 +3,143 @@
 struct net_device *ctem_dev;
 
 static int setup_sock_addr(struct sockaddr **addr, int port, u32 ip);
+static int internal_msgbuilder_flush(struct net_device *dev);
+
+static int internal_msgbuilder_flush(struct net_device *dev)
+{
+    struct ctem_priv *priv = netdev_priv(dev);
+    pktbuilder_t *pkt_builder = priv->pkt_builder;
+    struct timespec64 ts;
+    struct can2eth_pkthdr *pkthdr;
+    int r;
+
+    ktime_get_real_ts64(&ts);
+
+    if (pkt_builder->empty)
+    {
+        pkt_builder->lastflush = ts;
+        return 0;
+    }
+
+    pkthdr = (void *)pkt_builder->buf;
+    pkthdr->magic = htonl(0x43324547); // "C2EG"
+    pkthdr->tv_sec = htonl(ts.tv_sec);
+    pkthdr->tv_nsec = htonl(ts.tv_nsec);
+    pkthdr->seqno = htons(++pkt_builder->last_tx_seqno);
+    pkthdr->size = htons((uint16_t)pkt_builder->pos);
+
+    r = pkt_builder->send(dev, pkt_builder->buf, pkt_builder->pos);
+    pkt_builder->empty = true;
+    pkt_builder->pos = sizeof(*pkthdr);
+    pkt_builder->lastflush = ts;
+    return r;
+}
+
+int msgbuilder_init(struct net_device *dev)
+{
+    struct ctem_priv *priv = netdev_priv(dev);
+    pktbuilder_t *pkt_builder;
+
+    priv->pkt_builder = (pktbuilder_t *)kmalloc(sizeof(pktbuilder_t), GFP_KERNEL);
+    pkt_builder = priv->pkt_builder;
+
+    pkt_builder->timeout_nsec = ctx_timeout_ns;
+    pkt_builder->pos = sizeof(struct can2eth_pkthdr);
+    pkt_builder->empty = true;
+    pkt_builder->send = &ctem_send_packet;
+
+    mutex_init(&pkt_builder->mutex);
+
+    priv->transmission_thread = kthread_create(ctem_packet_transmission_thread, dev, "transmission_thread");
+    if (IS_ERR(priv->reception_thread))
+    {
+        printk(KERN_ERR "%s: Error creating UDP thread\n", MODULE_NAME);
+        return PTR_ERR(priv->reception_thread);
+    }
+
+    return 0;
+}
+
+void msgbuilder_start(struct net_device *dev)
+{
+    struct ctem_priv *priv = netdev_priv(dev);
+
+    (void)wake_up_process(priv->transmission_thread);
+}
+
+static void msgbuilder_teardown(struct net_device *dev)
+{
+    struct ctem_priv *priv = netdev_priv(dev);
+
+    if (priv->reception_thread != NULL)
+        (void)kthread_stop(priv->transmission_thread);
+
+    kfree(priv->pkt_builder);
+}
+
+int msgbuilder_flush_if_it_is_time(struct net_device *dev)
+{
+    struct ctem_priv *priv = netdev_priv(dev);
+    pktbuilder_t *pkt_builder = priv->pkt_builder;
+    struct timespec64 now;
+    uint64_t now_ns;
+    uint64_t lst_ns;
+    uint64_t since;
+    int result = -4;
+
+    mutex_lock(&pkt_builder->mutex);
+
+    ktime_get_real_ts64(&now);
+    now_ns = now.tv_sec * 1000000000ULL + now.tv_nsec;
+    lst_ns = pkt_builder->lastflush.tv_sec * 1000000000ULL + pkt_builder->lastflush.tv_nsec;
+    since = now_ns - lst_ns;
+
+    if (since > pkt_builder->timeout_nsec)
+    {
+        result = internal_msgbuilder_flush(dev);
+    }
+
+    mutex_unlock(&pkt_builder->mutex);
+
+    return result;
+}
+
+int msgbuilder_enqueue(struct net_device *dev, void *data, uint16_t len, uint16_t ctype)
+{
+    struct ctem_priv *priv = netdev_priv(dev);
+    pktbuilder_t *pkt_builder = priv->pkt_builder;
+    int result = -1;
+
+    mutex_lock(&pkt_builder->mutex);
+
+    if (pkt_builder->pos + len + 4 > CTEM_TX_BUFFER_SIZE)
+    {
+        int r = internal_msgbuilder_flush(dev);
+        if (r < 0)
+        {
+            result = -3;
+        }
+    }
+
+    if (pkt_builder->pos + len + 4 <= CTEM_TX_BUFFER_SIZE)
+    {
+        uint16_t chunksize = htons(len);
+        uint16_t chunktype = htons(ctype);
+        memcpy(pkt_builder->buf + pkt_builder->pos, &chunksize, sizeof(chunksize));
+        pkt_builder->pos += 2;
+        memcpy(pkt_builder->buf + pkt_builder->pos, &chunktype, sizeof(chunksize));
+        pkt_builder->pos += 2;
+        memcpy(pkt_builder->buf + pkt_builder->pos, data, len);
+        pkt_builder->pos += len;
+        pkt_builder->empty = false;
+        result = 0;
+    }
+
+    mutex_unlock(&pkt_builder->mutex);
+
+    result = msgbuilder_flush_if_it_is_time(dev);
+    return result;
+}
 
 static int setup_sock_addr(struct sockaddr **addr, int port, u32 ip)
 {
@@ -92,47 +229,72 @@ static int ctem_stop(struct net_device *dev)
 
 static netdev_tx_t ctem_xmit(struct sk_buff *skb, struct net_device *dev)
 {
-    struct ctem_priv *priv = netdev_priv(dev);
-    struct can_frame *frame = (struct can_frame *)skb->data;
-    struct msghdr msg;
-    struct kvec iov;
-    char can_frame_data[sizeof(struct can_frame)];
-    int ret;
+    struct can2eth_can_chunk frame;
+    struct timespec64 ts;
 
-    if (printk_ratelimit())
-        printk(KERN_INFO "%s: TX CAN - FRAME: Id: %d , %x %x %x %x %x %x %x %x\n", MODULE_NAME, frame->can_id, frame->data[0], frame->data[1], frame->data[2], frame->data[3], frame->data[4], frame->data[5], frame->data[6], frame->data[7]);
+    memset(&frame, 0, sizeof(struct can2eth_can_chunk));
 
-    memset(&msg, 0, sizeof(msg));
-    memset(&iov, 0, sizeof(iov));
+    ktime_get_real_ts64(&ts);
 
-    memcpy(can_frame_data, frame, sizeof(can_frame_data));
-
-    iov.iov_base = frame;
-    iov.iov_len = sizeof(can_frame_data);
-
-    msg.msg_name = priv->udp_addr_dst;
-    msg.msg_namelen = sizeof(*priv->udp_addr_dst);
-
-    ret = kernel_sendmsg(priv->udp_socket, &msg, &iov, 1, iov.iov_len);
-
-    if (ret < 0)
+    if (skb->len > CAN_MTU)
     {
-        if (printk_ratelimit())
-            printk(KERN_WARNING "%s: Did not send message! Error: %d\n", MODULE_NAME, ret);
+        /* Handle canfd */
 
-        priv->stats->tx_errors++;
-        priv->stats->tx_dropped++;
+        struct canfd_frame *canfd_frame = (struct canfd_frame *)skb->data;
+
+        frame.can_id = cpu_to_be32(canfd_frame->can_id);
+        frame.len = canfd_frame->len;
+        frame.flags = canfd_frame->flags;
+
+        memcpy(frame.data, canfd_frame->data, frame.len);
     }
+
     else
     {
-        if (printk_ratelimit())
-            printk(KERN_INFO "%s: Send %d bytes.\n", MODULE_NAME, ret);
-        priv->stats->tx_packets++;
-        priv->stats->tx_bytes += ret;
+        /* Handle can */
+
+        struct can_frame *can_frame = (struct can_frame *)skb->data;
+
+        frame.can_id = cpu_to_be32(can_frame->can_id);
+        frame.len = can_frame->len;
+
+        memcpy(frame.data, can_frame->data, frame.len);
     }
 
-    dev_kfree_skb(skb);
-    return NETDEV_TX_OK;
+    frame.tv_nsec = htonl((uint32_t)ts.tv_nsec);
+    frame.tv_sec = htonl((uint32_t)ts.tv_sec);
+
+    return msgbuilder_enqueue(dev, &frame, sizeof(frame) - 64 + frame.len, 0xc0fe);
+}
+
+static int ctem_packet_transmission_thread(void *arg)
+{
+    struct net_device *dev = (struct net_device *)arg;
+    struct ctem_priv *priv = netdev_priv(dev);
+    static struct timespec64 last_ka = {0};
+
+    printk(KERN_INFO "%s: start transmission thread\n", MODULE_NAME);
+
+    while (!kthread_should_stop())
+    {
+        struct timespec64 now;
+
+        msleep(100);
+        msgbuilder_flush_if_it_is_time(dev);
+
+        ktime_get_boottime_ts64(&now);
+        if (timespec64_sub(now, last_ka).tv_sec >= 1)
+        {
+            stats_and_keepalive_chunk_t statchunk;
+            last_ka = now;
+            statchunk.total_frames_relayed = htonl(priv->stats->tx_packets);
+            msgbuilder_enqueue(dev, &statchunk, sizeof(statchunk), 0x57a7);
+        }
+    }
+
+    printk(KERN_INFO "%s: stopped transmission thread\n", MODULE_NAME);
+
+    return 0;
 }
 
 static int ctem_parse_frame(struct net_device *dev, void *buf, size_t sz)
@@ -282,7 +444,7 @@ static int ctem_packet_reception_thread(void *arg)
         struct msghdr msg;
         struct sockaddr_in sender_addr;
         struct kvec iov;
-        unsigned char receive_buffer[CTEM_BUFFER_SIZE];
+        unsigned char receive_buffer[CTEM_RX_BUFFER_SIZE];
         int ret;
 
         // initalize structs
@@ -327,7 +489,7 @@ static void ctem_start_udp(struct net_device *dev)
 {
     struct ctem_priv *priv = netdev_priv(dev);
 
-    (void)wake_up_process(priv->udp_thread);
+    (void)wake_up_process(priv->reception_thread);
 }
 
 static int ctem_setup_udp(struct net_device *dev, u32 udp_dest_addr, int dest_port, int src_port)
@@ -367,11 +529,11 @@ static int ctem_setup_udp(struct net_device *dev, u32 udp_dest_addr, int dest_po
         return ret;
     }
 
-    priv->udp_thread = kthread_create(ctem_packet_reception_thread, dev, "udp_thread");
-    if (IS_ERR(priv->udp_thread))
+    priv->reception_thread = kthread_create(ctem_packet_reception_thread, dev, "reception_thread");
+    if (IS_ERR(priv->reception_thread))
     {
         printk(KERN_ERR "%s: Error creating UDP thread\n", MODULE_NAME);
-        return PTR_ERR(priv->udp_thread);
+        return PTR_ERR(priv->reception_thread);
     }
 
     return ret;
@@ -382,8 +544,8 @@ static void ctem_teardown_udp(struct net_device *dev)
     struct ctem_priv *priv;
     priv = netdev_priv(dev);
 
-    if (priv->udp_thread != NULL)
-        (void)kthread_stop(priv->udp_thread);
+    if (priv->reception_thread != NULL)
+        (void)kthread_stop(priv->reception_thread);
     if (priv->udp_socket != NULL)
         sock_release(priv->udp_socket);
     if (priv->udp_addr_src != NULL)
@@ -392,12 +554,69 @@ static void ctem_teardown_udp(struct net_device *dev)
         kfree(priv->udp_addr_dst);
 }
 
-static void ctem_init(struct net_device *dev)
+static int ctem_send_packet(struct net_device *dev, void *data, size_t len)
+{
+    struct ctem_priv *priv = netdev_priv(dev);
+    struct msghdr msg;
+    struct kvec iov;
+    char *packet_data;
+    int ret;
+
+    packet_data = (char *)kmalloc(len * sizeof(char), GFP_KERNEL);
+
+    memset(&msg, 0, sizeof(msg));
+    memset(&iov, 0, sizeof(iov));
+
+    memcpy(packet_data, data, len);
+
+    iov.iov_base = packet_data;
+    iov.iov_len = len;
+
+    msg.msg_name = priv->udp_addr_dst;
+    msg.msg_namelen = sizeof(*priv->udp_addr_dst);
+
+    ret = kernel_sendmsg(priv->udp_socket, &msg, &iov, 1, iov.iov_len);
+
+    if (ret < 0)
+    {
+        if (printk_ratelimit())
+            printk(KERN_WARNING "%s: Did not send message! Error: %d\n", MODULE_NAME, ret);
+
+        priv->stats->tx_errors++;
+        priv->stats->tx_dropped++;
+    }
+    else
+    {
+        if (printk_ratelimit())
+            printk(KERN_INFO "%s: Send %d bytes.\n", MODULE_NAME, ret);
+        priv->stats->tx_packets++;
+        priv->stats->tx_bytes += ret;
+    }
+
+    return NETDEV_TX_OK;
+}
+
+static void ctem_free_priv(struct ctem_priv *priv)
+{
+    if (priv == NULL)
+        return;
+
+    kfree(priv->stats);
+    kfree(priv->udp_socket);
+    kfree(priv->udp_addr_dst);
+    kfree(priv->udp_addr_src);
+
+    // free priv itself
+    kfree(priv);
+}
+
+static int ctem_init(struct net_device *dev)
 {
     struct ctem_priv *priv;
+    priv = netdev_priv(dev);
 
     dev->type = ARPHRD_CAN;
-    dev->mtu = CAN_MTU;
+    dev->mtu = CANFD_MTU;
     dev->hard_header_len = 0;
     dev->addr_len = 0;
     dev->tx_queue_len = 10;
@@ -410,25 +629,32 @@ static void ctem_init(struct net_device *dev)
 
     dev->needs_free_netdev = true;
 
+    priv->can.bittiming_const = &ctem_can_fd_bit_timing_max;
+
+    priv->can.ctrlmode_supported = CAN_CTRLMODE_FD;
+
     /*
      * Initialize priv field
      */
-    priv = netdev_priv(dev);
     memset(priv, 0, sizeof(struct ctem_priv));
     priv->dev = dev;
-    priv->udp_socket = NULL;
-    priv->udp_thread = NULL;
-    priv->udp_addr_src = NULL;
-    priv->udp_addr_dst = NULL;
 
     // initialize stats struct
     priv->stats = kmalloc(sizeof(struct rtnl_link_stats64), GFP_KERNEL);
+
+    if (priv->stats == NULL)
+        return -ENOMEM;
+
     memset(priv->stats, 0, sizeof(struct rtnl_link_stats64));
+
+    return 0;
 }
 
 static __exit void ctem_cleanup_module(void)
 {
     printk(KERN_DEBUG "%s: Unregistering CAN to Eth Driver\n", MODULE_NAME);
+
+    msgbuilder_teardown(ctem_dev);
 
     ctem_teardown_udp(ctem_dev);
 
@@ -437,7 +663,7 @@ static __exit void ctem_cleanup_module(void)
 
 static __init int ctem_init_module(void)
 {
-    int ret;
+    int r;
     u32 dest_addr = INADDR_ANY;
 
     printk(KERN_DEBUG "%s: Registering CAN to Eth Driver\n", MODULE_NAME);
@@ -452,26 +678,47 @@ static __init int ctem_init_module(void)
 
     ctem_dev = alloc_candev(sizeof(struct ctem_priv), 0);
 
-    ctem_init(ctem_dev);
+    if (ctem_dev == NULL)
+        goto out;
 
-    ret = ctem_setup_udp(ctem_dev, dest_addr, udp_dest_port, udp_src_port);
-    if (ret)
+    r = ctem_init(ctem_dev);
+    if (r)
+    {
+        printk(KERN_ERR "%s: Failed to initialize priv data\n", MODULE_NAME);
+        goto out_init;
+    }
+
+    r = ctem_setup_udp(ctem_dev, dest_addr, udp_dest_port, udp_src_port);
+    if (r)
     {
         printk(KERN_ERR "%s: Failed to setup udp\n", MODULE_NAME);
         ctem_teardown_udp(ctem_dev);
-        return ret;
+        return r;
+    }
+
+    r = msgbuilder_init(ctem_dev);
+    if (r)
+    {
+        printk(KERN_ERR "%s: Failed to initialize msgbuilder\n", MODULE_NAME);
     }
 
     ctem_start_udp(ctem_dev);
 
-    ret = register_candev(ctem_dev);
-    if (ret)
+    msgbuilder_start(ctem_dev);
+
+    r = register_candev(ctem_dev);
+    if (r)
     {
         free_candev(ctem_dev);
-        return ret;
+        return r;
     }
 
     return 0;
+
+out_init:
+    free_candev(ctem_dev);
+out:
+    return -1;
 }
 
 module_init(ctem_init_module);
