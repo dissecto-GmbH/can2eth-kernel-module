@@ -149,6 +149,9 @@ static void ctem_start_udp(struct net_device *dev);
 static int ctem_setup_udp(struct net_device *dev, u32 dest_addr, int dest_port, int src_port);
 static void ctem_teardown_udp(struct net_device *dev);
 
+static int setup_sock_addr(struct sockaddr **addr, int port, u32 ip);
+static int internal_msgbuilder_flush(struct net_device *dev);
+
 static int ctem_packet_reception_thread(void *arg);
 static int ctem_parse_frame(struct net_device *dev, void *buf, size_t size);
 

@@ -2,9 +2,6 @@
 
 struct net_device *ctem_dev;
 
-static int setup_sock_addr(struct sockaddr **addr, int port, u32 ip);
-static int internal_msgbuilder_flush(struct net_device *dev);
-
 static int internal_msgbuilder_flush(struct net_device *dev)
 {
     struct ctem_priv *priv = netdev_priv(dev);
@@ -51,10 +48,10 @@ int msgbuilder_init(struct net_device *dev)
     mutex_init(&pkt_builder->mutex);
 
     priv->transmission_thread = kthread_create(ctem_packet_transmission_thread, dev, "transmission_thread");
-    if (IS_ERR(priv->reception_thread))
+    if (IS_ERR(priv->transmission_thread))
     {
         printk(KERN_ERR "%s: Error creating UDP thread\n", MODULE_NAME);
-        return PTR_ERR(priv->reception_thread);
+        return PTR_ERR(priv->transmission_thread);
     }
 
     return 0;
@@ -605,9 +602,6 @@ static void ctem_free_priv(struct ctem_priv *priv)
     kfree(priv->udp_socket);
     kfree(priv->udp_addr_dst);
     kfree(priv->udp_addr_src);
-
-    // free priv itself
-    kfree(priv);
 }
 
 static int ctem_init(struct net_device *dev)
@@ -692,14 +686,14 @@ static __init int ctem_init_module(void)
     if (r)
     {
         printk(KERN_ERR "%s: Failed to setup udp\n", MODULE_NAME);
-        ctem_teardown_udp(ctem_dev);
-        return r;
+        goto out_udp;
     }
 
     r = msgbuilder_init(ctem_dev);
     if (r)
     {
         printk(KERN_ERR "%s: Failed to initialize msgbuilder\n", MODULE_NAME);
+        goto out_msgbuilder;
     }
 
     ctem_start_udp(ctem_dev);
@@ -709,12 +703,18 @@ static __init int ctem_init_module(void)
     r = register_candev(ctem_dev);
     if (r)
     {
-        free_candev(ctem_dev);
-        return r;
+        printk(KERN_ERR "%s: Failed to register the network device\n", MODULE_NAME);
+        goto out_register;
     }
 
     return 0;
 
+out_register:
+    msgbuilder_teardown(ctem_dev);
+out_msgbuilder:
+    ctem_teardown_udp(ctem_dev);
+out_udp:
+    ctem_free_priv(netdev_priv(ctem_dev));
 out_init:
     free_candev(ctem_dev);
 out:
