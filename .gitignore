@@ -8,3 +8,4 @@
 *.d
 *.mod.*
 *.sh
+.clang-format
