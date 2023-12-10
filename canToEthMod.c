@@ -34,6 +34,8 @@
 #define MAGIC_PACKET     0xc0fe
 #define MAGIC_KEEP_ALIVE 0x57a7
 
+#define CAN_PAYLOAD 4
+
 struct net_device *ctem_dev;
 
 static char *udp_dest_ip_str;
@@ -167,15 +169,15 @@ ctem_send_packet(struct net_device *dev, void *data, size_t len) {
     ret = kernel_sendmsg(priv->udp_socket, &msg, &iov, 1, iov.iov_len);
 
     if (ret < 0) {
-        if (printk_ratelimit())
-            printk(KERN_WARNING "%s: Did not send message! Error: %d\n",
-                   MODULE_NAME, ret);
+
+        netdev_warn(dev, "%s: Did not send message! Error: %d\n", MODULE_NAME,
+                    ret);
 
         priv->stats->tx_errors++;
         priv->stats->tx_dropped++;
     } else {
-        if (printk_ratelimit())
-            printk(KERN_INFO "%s: Send %d bytes.\n", MODULE_NAME, ret);
+
+        netdev_dbg(dev, "%s: Send %d bytes.\n", MODULE_NAME, ret);
         priv->stats->tx_packets++;
         priv->stats->tx_bytes += ret;
     }
@@ -189,7 +191,7 @@ ctem_packet_transmission_thread(void *arg) {
     struct ctem_priv *priv = netdev_priv(dev);
     static struct timespec64 last_ka = {0};
 
-    printk(KERN_INFO "%s: start transmission thread\n", MODULE_NAME);
+    netdev_info(dev, "%s: start transmission thread\n", MODULE_NAME);
 
     while (!kthread_should_stop()) {
         struct timespec64 now;
@@ -207,7 +209,7 @@ ctem_packet_transmission_thread(void *arg) {
         }
     }
 
-    printk(KERN_INFO "%s: stopped transmission thread\n", MODULE_NAME);
+    netdev_info(dev, "%s: stopped transmission thread\n", MODULE_NAME);
 
     return 0;
 }
@@ -419,11 +421,12 @@ ctem_xmit(struct sk_buff *skb, struct net_device *dev) {
 
         struct canfd_frame *canfd_frame = (struct canfd_frame *) skb->data;
 
-        frame.can_id = cpu_to_be32(canfd_frame->can_id);
+        frame.can_id = htonl(canfd_frame->can_id);
         frame.len = canfd_frame->len;
         frame.flags = canfd_frame->flags;
 
         memcpy(frame.data, canfd_frame->data, frame.len);
+
     }
 
     else {
@@ -431,7 +434,7 @@ ctem_xmit(struct sk_buff *skb, struct net_device *dev) {
 
         struct can_frame *can_frame = (struct can_frame *) skb->data;
 
-        frame.can_id = cpu_to_be32(can_frame->can_id);
+        frame.can_id = htonl(can_frame->can_id);
         frame.len = can_frame->len;
 
         memcpy(frame.data, can_frame->data, frame.len);
@@ -510,13 +513,14 @@ ctem_parse_frame(struct net_device *dev, void *buf, size_t sz) {
             priv->stats->rx_packets++;
 
             if (len + offsetof(struct can2eth_can_chunk, data) != chunk_size) {
-                printk(KERN_WARNING
-                       "%s: can chunk size is unexpected (16+%u / %u)\n",
-                       MODULE_NAME, len, chunk_size);
+                netdev_warn(dev,
+                            "%s: can chunk size is unexpected (16+%u / %u)\n",
+                            MODULE_NAME, len, chunk_size);
                 break;
             }
             memcpy(data, can_chunk->data, len);
-            if (can_id & 0x80000000) {
+
+            if (len > CAN_PAYLOAD) {
                 // canfd frames
                 struct canfd_frame *frame;
 
@@ -528,12 +532,13 @@ ctem_parse_frame(struct net_device *dev, void *buf, size_t sz) {
                     return -ENOMEM;
                 }
 
-                frame->can_id = htonl(can_chunk->can_id);
+                frame->can_id = can_id;
                 frame->len = can_chunk->len;
                 frame->flags = can_chunk->flags;
                 for (unsigned i = 0; i < frame->len; i++) {
                     frame->data[i] = can_chunk->data[i];
                 }
+
             } else {
                 // can frames
                 struct can_frame *frame;
@@ -545,7 +550,7 @@ ctem_parse_frame(struct net_device *dev, void *buf, size_t sz) {
                                MODULE_NAME);
                     return -ENOMEM;
                 }
-                frame->can_id = htonl(can_chunk->can_id);
+                frame->can_id = can_id;
                 frame->len = can_chunk->len;
                 for (unsigned i = 0; i < frame->len; i++) {
                     frame->data[i] = can_chunk->data[i];
@@ -563,8 +568,8 @@ ctem_parse_frame(struct net_device *dev, void *buf, size_t sz) {
             break;
         }
         default: {
-            printk(KERN_WARNING "%s: warning: unknown chunk type 0x%04x.\n",
-                   MODULE_NAME, chunk_type);
+            netdev_warn(dev, "%s: warning: unknown chunk type 0x%04x.\n",
+                        MODULE_NAME, chunk_type);
             break;
         }
         }
@@ -609,9 +614,9 @@ ctem_packet_reception_thread(void *arg) {
         ret = kernel_recvmsg(priv->udp_socket, &msg, &iov, 1, iov.iov_len,
                              MSG_WAITALL);
         if (ret < 0) {
-            if (printk_ratelimit())
-                netdev_dbg(dev, "%s: Error while listening to udp socket: %d\n",
-                           MODULE_NAME, ret);
+
+            netdev_dbg(dev, "%s: Error while listening to udp socket: %d\n",
+                       MODULE_NAME, ret);
 
             priv->stats->rx_errors++;
         } else {
@@ -619,8 +624,7 @@ ctem_packet_reception_thread(void *arg) {
             /*
              * TODO: Use workqueue here
              */
-            if (printk_ratelimit())
-                netdev_dbg(dev, "%s: Received %d Bytes.\n", MODULE_NAME, ret);
+            netdev_dbg(dev, "%s: Received %d Bytes.\n", MODULE_NAME, ret);
 
             /*
              * TODO: Handle return value
