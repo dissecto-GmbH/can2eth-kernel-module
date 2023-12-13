@@ -24,6 +24,7 @@
 #include <linux/time64.h>
 #include <linux/timekeeping.h>
 #include <linux/types.h>
+#include <linux/workqueue.h>
 
 #define MODULE_NAME         "CanToEth"
 #define CTEM_RX_BUFFER_SIZE 1800
@@ -110,6 +111,15 @@ struct ctem_priv {
     pktbuilder_t *pkt_builder;
     struct task_struct *transmission_thread;
     struct task_struct *reception_thread;
+    struct workqueue_struct *workqueue;
+    struct mutex rx_mutex;
+};
+
+struct ctem_reception_work {
+    struct work_struct work;
+    struct net_device *dev;
+    unsigned char buffer[CTEM_RX_BUFFER_SIZE];
+    size_t size;
 };
 
 static const struct ethtool_ops ctem_ethtool_ops = {
@@ -560,10 +570,14 @@ ctem_parse_frame(struct net_device *dev, void *buf, size_t sz) {
             // set skb timestamp to timestamp from chunk
             skb->tstamp = timespec64_to_ktime(ts);
 
+            mutex_lock(&priv->rx_mutex);
+
             ret = can_rx_offload_queue_tail(&priv->offload, skb);
             if (ret)
                 priv->stats->rx_errors++;
             can_rx_offload_irq_finish(&priv->offload);
+
+            mutex_unlock(&priv->rx_mutex);
 
             break;
         }
@@ -585,6 +599,17 @@ ctem_parse_frame(struct net_device *dev, void *buf, size_t sz) {
     }
 
     return NET_RX_SUCCESS;
+}
+
+static void
+ctem_reception_work_function(struct work_struct *work) {
+    struct ctem_reception_work *ctem_work =
+        container_of(work, struct ctem_reception_work, work);
+
+    ctem_parse_frame(ctem_work->dev, (void *) ctem_work->buffer,
+                     ctem_work->size);
+
+    kfree(ctem_work);
 }
 
 static int
@@ -620,16 +645,22 @@ ctem_packet_reception_thread(void *arg) {
 
             priv->stats->rx_errors++;
         } else {
-            int err;
-            /*
-             * TODO: Use workqueue here
-             */
+            struct ctem_reception_work *work;
+
             netdev_dbg(dev, "%s: Received %d Bytes.\n", MODULE_NAME, ret);
 
-            /*
-             * TODO: Handle return value
-             */
-            err = ctem_parse_frame(dev, receive_buffer, ret);
+            work = kmalloc(sizeof(struct ctem_reception_work), GFP_KERNEL);
+            if (!work) {
+                netdev_err(dev, "%s: Failed to allocate work\n", MODULE_NAME);
+            } else {
+
+                work->dev = dev;
+                memcpy(work->buffer, receive_buffer, ret);
+                work->size = ret;
+
+                INIT_WORK(&work->work, ctem_reception_work_function);
+                queue_work(priv->workqueue, &work->work);
+            }
         }
     }
 
@@ -700,13 +731,13 @@ ctem_teardown_udp(struct net_device *dev) {
     struct ctem_priv *priv;
     priv = netdev_priv(dev);
 
-    if (priv->reception_thread != NULL)
+    if (priv->reception_thread)
         (void) kthread_stop(priv->reception_thread);
-    if (priv->udp_socket != NULL)
+    if (priv->udp_socket)
         sock_release(priv->udp_socket);
-    if (priv->udp_addr_src != NULL)
+    if (priv->udp_addr_src)
         kfree(priv->udp_addr_src);
-    if (priv->udp_addr_dst != NULL)
+    if (priv->udp_addr_dst)
         kfree(priv->udp_addr_dst);
 }
 
@@ -762,16 +793,36 @@ ctem_init(struct net_device *dev) {
 
     memset(priv->stats, 0, sizeof(struct rtnl_link_stats64));
 
+    priv->workqueue = create_workqueue("ctem_rx_workqueue");
+
+    if (!priv->workqueue) {
+        netdev_err(dev, "%s: Failed to create workqueue\n", MODULE_NAME);
+        return -ENOMEM;
+    }
+
+    mutex_init(&priv->rx_mutex);
+
     return 0;
 }
 
 static __exit void
 ctem_cleanup_module(void) {
+    struct ctem_priv *priv = netdev_priv(ctem_dev);
+
     pr_debug("%s: Unregistering CAN to Eth Driver\n", MODULE_NAME);
+
+    if (priv->reception_thread)
+        (void) kthread_stop(priv->reception_thread);
+
+    flush_workqueue(priv->workqueue);
+
+    mutex_lock(&priv->rx_mutex);
 
     msgbuilder_teardown(ctem_dev);
 
     ctem_teardown_udp(ctem_dev);
+
+    destroy_workqueue(priv->workqueue);
 
     unregister_netdev(ctem_dev);
 }
