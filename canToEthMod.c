@@ -1,6 +1,7 @@
 #include <linux/can.h>
 #include <linux/can/dev.h>
 #include <linux/can/rx-offload.h>
+#include <linux/delay.h>
 #include <linux/if_arp.h>
 #include <linux/inet.h>
 #include <linux/init.h>
@@ -13,7 +14,7 @@
 
 #define MODULE_NAME "CanToEth"
 
-#define CTEM_RX_BUFFER_SIZE 1800
+#define CTEM_RX_BUFFER_SIZE 2000
 #define CTEM_TX_BUFFER_SIZE 1000
 #define CTEM_NAPI_WEIGHT    4
 
@@ -24,13 +25,19 @@
 #define NUM_ADDRESSES  10
 #define NUM_INTERFACES 2
 
-#define CAN_PAYLOAD 4
+#define CAN_PAYLOAD 8
+
+// this is the interval between checks for timeouts in the msgbuilder; since it
+// uses usleep_range, a lower and upper limit have to be provided
+#define CTEM_MIN_TIMEOUT_CHECK 900    // in microseconds
+#define CTEM_MAX_TIMEOUT_CHECK 1100   // microseconds
 
 static char *ip_addrs[NUM_ADDRESSES];
+static int num_ip_addrs = 0;   // the actual number of ip address provided
 static int port = 8765;
 static uint32_t timeout_ns = 10000000;
 
-module_param_array(ip_addrs, charp, NULL, 0);
+module_param_array(ip_addrs, charp, &num_ip_addrs, 0000);
 module_param(port, int, S_IRUGO);
 module_param(timeout_ns, uint, S_IRUGO);
 
@@ -52,7 +59,8 @@ typedef struct ctem_pktbuilder {
 
 struct ctem_comm_handler {
     struct socket *udp_socket;
-    struct sockaddr *dest_addrs[NUM_ADDRESSES];
+    struct sockaddr **dest_addrs;
+    int num_addrs;
     struct workqueue_struct *workqueue;
     struct ctem_pktbuilder *pktbuilder;
     struct task_struct *reception_thread;
@@ -99,7 +107,7 @@ struct ctem_priv {
 struct ctem_reception_work {
     struct work_struct work;
     struct ctem_comm_handler *handler;
-    unsigned char buffer[CTEM_RX_BUFFER_SIZE];
+    unsigned char *buffer;
     size_t size;
 };
 
@@ -196,7 +204,7 @@ msgbuilder_enqueue(struct ctem_comm_handler *handler, void *data, uint16_t len,
 
 static int
 ctem_send_packet(struct ctem_comm_handler *handler, void *data, size_t len) {
-    for (unsigned int i = 0; i < NUM_ADDRESSES; i++) {
+    for (unsigned int i = 0; i < handler->num_addrs; i++) {
         struct sockaddr *addr;
         struct msghdr msg;
         struct kvec iov;
@@ -209,6 +217,10 @@ ctem_send_packet(struct ctem_comm_handler *handler, void *data, size_t len) {
         addr = handler->dest_addrs[i];
 
         packet_data = (char *) kmalloc(len * sizeof(char), GFP_KERNEL);
+        if (!packet_data) {
+            pr_err("%s: Error sending UDP Frame\n", MODULE_NAME);
+            continue;
+        }
 
         memset(&msg, 0, sizeof(msg));
         memset(&iov, 0, sizeof(iov));
@@ -222,6 +234,8 @@ ctem_send_packet(struct ctem_comm_handler *handler, void *data, size_t len) {
         msg.msg_namelen = sizeof(*addr);
 
         ret = kernel_sendmsg(handler->udp_socket, &msg, &iov, 1, iov.iov_len);
+
+        kfree(packet_data);
     }
     return NETDEV_TX_OK;
 }
@@ -236,14 +250,13 @@ ctem_transmission_thread(void *arg) {
     while (!kthread_should_stop()) {
         struct timespec64 now;
 
-        msleep(100);
+        usleep_range(CTEM_MIN_TIMEOUT_CHECK, CTEM_MAX_TIMEOUT_CHECK);
         msgbuilder_flush_if_it_is_time(handler);
 
         ktime_get_boottime_ts64(&now);
         if (timespec64_sub(now, last_ka).tv_sec >= 1) {
             struct stats_and_keepalive_chunk statchunk;
             last_ka = now;
-            // statchunk.total_frames_relayed = htonl(priv->stats->tx_packets);
             msgbuilder_enqueue(handler, &statchunk, sizeof(statchunk),
                                MAGIC_KEEP_ALIVE);
         }
@@ -270,9 +283,9 @@ msgbuilder_init(struct ctem_comm_handler *handler) {
     mutex_init(&pkt_builder->mutex);
 
     handler->transmission_thread = kthread_create(
-        ctem_transmission_thread, handler, "transmission_thread");
+        ctem_transmission_thread, handler, "ctem_transmission_thread");
     if (IS_ERR(handler->transmission_thread)) {
-        pr_err("%s: Error creating UDP thread\n", MODULE_NAME);
+        pr_err("%s: Error creating Transmission thread\n", MODULE_NAME);
         return PTR_ERR(handler->transmission_thread);
     }
 
@@ -435,7 +448,8 @@ ctem_reception_work_function(struct work_struct *work) {
 
     ctem_parse_frame((void *) ctem_work->buffer, ctem_work->size);
 
-    kfree(work);
+    kfree(ctem_work->buffer);
+    kfree(ctem_work);
 }
 
 static int
@@ -445,66 +459,48 @@ ctem_reception_thread(void *arg) {
     pr_debug("%s: Started listing\n", MODULE_NAME);
 
     while (!kthread_should_stop()) {
-        struct msghdr msg;
-        struct sockaddr_in sender_addr;
+        struct msghdr msg = {0};
         struct kvec iov;
-        unsigned char receive_buffer[CTEM_RX_BUFFER_SIZE];
+        unsigned char *receive_buffer =
+            kmalloc(CTEM_RX_BUFFER_SIZE, GFP_KERNEL);
         int ret;
 
-        // initalize structs
-        memset(&sender_addr, 0, sizeof(sender_addr));
-        memset(&msg, 0, sizeof(msg));
-        memset(&iov, 0, sizeof(iov));
-        memset(receive_buffer, 0, sizeof(receive_buffer));
+        if (!receive_buffer) {
+            pr_err("%s: Failed to allocate reception buffer\n", MODULE_NAME);
+            continue;
+        }
 
         // set up iov struct
         iov.iov_base = receive_buffer;
-        iov.iov_len = sizeof(receive_buffer);
+        iov.iov_len = CTEM_RX_BUFFER_SIZE;
 
         ret = kernel_recvmsg(handler->udp_socket, &msg, &iov, 1, iov.iov_len,
                              MSG_WAITALL);
         if (ret < 0) {
-
             pr_err("%s: Error while listening to udp socket: %d\n", MODULE_NAME,
                    ret);
         } else {
-            struct ctem_reception_work *work;
+            struct ctem_reception_work *work =
+                kmalloc(sizeof(struct ctem_reception_work), GFP_KERNEL);
 
-            pr_debug("%s: Received %d Bytes.\n", MODULE_NAME, ret);
-
-            work = kmalloc(sizeof(struct ctem_reception_work), GFP_KERNEL);
             if (!work) {
                 pr_err("%s: Failed to allocate work\n", MODULE_NAME);
-            } else {
-
-                work->handler = handler;
-                memcpy(work->buffer, receive_buffer, ret);
-                work->size = ret;
-
-                INIT_WORK(&work->work, ctem_reception_work_function);
-                queue_work(handler->workqueue, &work->work);
+                kfree(receive_buffer);
+                continue;
             }
+
+            work->handler = handler;
+            work->buffer = receive_buffer;
+            work->size = ret;
+
+            INIT_WORK(&work->work, ctem_reception_work_function);
+            queue_work(handler->workqueue, &work->work);
+
+            pr_debug("%s: Received %d Bytes.\n", MODULE_NAME, ret);
         }
     }
 
     pr_debug("%s: Stopped listing\n", MODULE_NAME);
-    return 0;
-}
-
-static int
-setup_sock_addr(struct sockaddr **addr, int port, u32 ip) {
-    struct sockaddr_in *udp_addr =
-        kmalloc(sizeof(struct sockaddr_in), GFP_KERNEL);
-
-    if (!udp_addr)
-        return -ENOMEM;
-
-    memset(udp_addr, 0, sizeof(struct sockaddr_in));
-    udp_addr->sin_family = PF_INET;
-    udp_addr->sin_port = htons(port);
-    udp_addr->sin_addr.s_addr = ip;
-    *addr = (struct sockaddr *) udp_addr;
-
     return 0;
 }
 
@@ -513,14 +509,19 @@ ctem_setup_udp(struct ctem_comm_handler *handler, int src_port) {
     struct sockaddr *src_addr;
     int ret;
 
-    ret = setup_sock_addr(&src_addr, src_port, INADDR_ANY);
-    if (ret) {
-        pr_err("%s: Error setting up udp listen addr %lu:%d\n", MODULE_NAME,
-               INADDR_ANY, src_port);
-        return ret;
+    struct sockaddr_in *udp_addr =
+        kmalloc(sizeof(struct sockaddr_in), GFP_KERNEL);
+
+    if (!udp_addr) {
+        pr_err("Error allocating the address the UDP is listing to\n");
+        return -ENOMEM;
     }
 
-    pr_debug("%s: listening to udp %lu:%d", MODULE_NAME, INADDR_ANY, src_port);
+    memset(udp_addr, 0, sizeof(struct sockaddr_in));
+    udp_addr->sin_family = PF_INET;
+    udp_addr->sin_port = htons(port);
+    udp_addr->sin_addr.s_addr = INADDR_ANY;
+    src_addr = (struct sockaddr *) udp_addr;
 
     // set up UDP socket
     ret = sock_create_kern(&init_net, PF_INET, SOCK_DGRAM, IPPROTO_UDP,
@@ -541,11 +542,84 @@ ctem_setup_udp(struct ctem_comm_handler *handler, int src_port) {
 }
 
 int
+parse_ip_port(const char *addr_port_str, u32 *ip_out, u16 *port_out) {
+    char ip_str[16];
+    int ret;
+    char *colon = strchr(addr_port_str, ':');
+
+    if (!colon || colon == addr_port_str || !*(colon + 1))
+        return -EINVAL;
+
+    strncpy(ip_str, addr_port_str, colon - addr_port_str);
+    ip_str[colon - addr_port_str] = '\0';
+
+    ret = in4_pton(ip_str, -1, (u8 *) ip_out, -1, NULL);
+    if (ret != 1)
+        return -EINVAL;
+
+    if (kstrtou16(colon + 1, 10, port_out))
+        return -EINVAL;
+
+    return 0;
+}
+
+int
 ctem_setup_communications(struct ctem_comm_handler *handler, int src_port,
-                          struct sockaddr *dest_addrs[], size_t len) {
+                          char **addrs, int num_addrs) {
     int ret;
 
-    memcpy(handler->dest_addrs, dest_addrs, len * sizeof(struct sockaddr *));
+    handler->dest_addrs = kmalloc(sizeof(struct sockaddr *), GFP_KERNEL);
+    if (!handler->dest_addrs) {
+        pr_err("Could not allocate destination addresses\n");
+        return -ENOMEM;
+    }
+
+    // parse input ip addresses
+    {
+        u32 ip;
+        u16 port;
+
+        if (!num_addrs) {
+            struct sockaddr_in *addr =
+                kmalloc(sizeof(struct sockaddr_in), GFP_KERNEL);
+            if (!addr) {
+                pr_err("Could not allocate ip addr\n");
+                return -ENOMEM;
+            }
+
+            addr->sin_family = PF_INET;
+            addr->sin_port = htons(port);
+            addr->sin_addr.s_addr = INADDR_ANY;
+
+            handler->dest_addrs[0] = (struct sockaddr *) addr;
+
+            handler->num_addrs = 1;
+        } else {
+
+            for (int i = 0; i < num_addrs; i++) {
+                ret = parse_ip_port(ip_addrs[i], &ip, &port);
+                if (ret) {
+                    pr_err("Invalid IP/port format: %s\n", ip_addrs[i]);
+                } else {
+                    pr_debug("Parsed IP: %pI4, Port: %u\n", &ip, port);
+                    struct sockaddr_in *addr =
+                        kmalloc(sizeof(struct sockaddr_in), GFP_KERNEL);
+                    if (!addr) {
+                        pr_err("Could not allocate ip addr\n");
+                        return -ENOMEM;
+                    }
+
+                    addr->sin_family = PF_INET;
+                    addr->sin_port = htons(port);
+                    addr->sin_addr.s_addr = ip;
+
+                    handler->dest_addrs[i] = (struct sockaddr *) addr;
+                }
+
+                handler->num_addrs = num_addrs;
+            }
+        }
+    }
 
     ret = ctem_setup_udp(handler, src_port);
 
@@ -580,7 +654,7 @@ ctem_teardown_communications(struct ctem_comm_handler *handler) {
     if (handler->udp_socket)
         sock_release(handler->udp_socket);
 
-    for (unsigned int i = 0; i < NUM_ADDRESSES; i++) {
+    for (int i = 0; i < handler->num_addrs; i++) {
         if (handler->dest_addrs[i])
             kfree(handler->dest_addrs[i]);
     }
@@ -700,7 +774,7 @@ ctem_init(struct net_device *dev, size_t if_idx) {
     dev->flags = IFF_NOARP;
 
     dev->netdev_ops = &ctem_netdev_ops;
-    // dev->ethtool_ops = &ctem_ethtool_ops;
+    dev->ethtool_ops = &ctem_ethtool_ops;
 
     /*
      * Initialize priv field
@@ -719,13 +793,13 @@ ctem_init(struct net_device *dev, size_t if_idx) {
 
 static __exit void
 ctem_cleanup_module(void) {
-    pr_debug("%s: Unregistering CAN to Eth Driver\n", MODULE_NAME);
+    pr_debug("%s: Starting cleanup of CAN to Eth Driver\n", MODULE_NAME);
 
     for (unsigned int i = 0; i < NUM_INTERFACES; i++) {
-        unregister_candev(ctem_devs[i]);
-    }
-    for (unsigned int i = 0; i < NUM_INTERFACES; i++) {
-        free_candev(ctem_devs[i]);
+        if (ctem_devs[i]) {
+            unregister_candev(ctem_devs[i]);
+            free_candev(ctem_devs[i]);
+        }
     }
 
     ctem_teardown_communications(ctem_communications);
@@ -734,9 +808,9 @@ ctem_cleanup_module(void) {
 
 static __init int
 ctem_init_module(void) {
-    unsigned int allocate_idx = 0;
-    unsigned int registered_idx = 0;
-    int ret = -1;
+    unsigned int allocate_idx;
+    unsigned int registered_idx;
+    int ret = -ENOMEM;
 
     pr_debug("%s: Registering CAN to Eth Driver\n", MODULE_NAME);
 
@@ -746,56 +820,34 @@ ctem_init_module(void) {
     if (!ctem_communications)
         goto out;
 
-    for (; allocate_idx < NUM_INTERFACES; allocate_idx++) {
+    for (allocate_idx = 0; allocate_idx < NUM_INTERFACES; allocate_idx++) {
         ctem_devs[allocate_idx] = alloc_candev(sizeof(struct ctem_priv), 0);
 
         if (!ctem_devs[allocate_idx])
-            goto out_alloc_devs;
+            goto out_free_previous_devs;
 
         ret = ctem_init(ctem_devs[allocate_idx], allocate_idx);
         if (ret) {
             netdev_err(ctem_devs[allocate_idx],
                        "%s: Failed to initialize priv data\n", MODULE_NAME);
-            goto out_alloc_devs;
+            free_candev(ctem_devs[allocate_idx]);
+            goto out_free_previous_devs;
         }
     }
 
-    {
-        struct sockaddr *dest_addrs[NUM_ADDRESSES];
-        unsigned int addr_idx = 0;
+    ret = ctem_setup_communications(ctem_communications, port, ip_addrs,
+                                    num_ip_addrs);
+    if (ret)
+        goto out_teardown_communications;
 
-        for (; addr_idx < NUM_ADDRESSES; addr_idx++) {
-            if (ip_addrs[addr_idx]) {
-                long ptr;
-                char *addr, *prt_str;
-                addr = strsep(&ip_addrs[addr_idx], ":");
-                prt_str = strsep(&ip_addrs[addr_idx], ":");
-
-                if (kstrtol(prt_str, 10, &ptr))
-                    break;
-
-                setup_sock_addr(&dest_addrs[addr_idx], (int) ptr,
-                                in_aton(addr));
-
-            } else {
-                break;
-            }
-        }
-
-        if (!addr_idx)
-            setup_sock_addr(&dest_addrs[addr_idx++], port, INADDR_ANY);
-
-        ctem_setup_communications(ctem_communications, port, dest_addrs,
-                                  addr_idx);
-    }
-
-    for (; registered_idx < NUM_INTERFACES; registered_idx++) {
+    for (registered_idx = 0; registered_idx < NUM_INTERFACES;
+         registered_idx++) {
         ret = register_candev(ctem_devs[registered_idx]);
         if (ret) {
             netdev_err(ctem_devs[registered_idx],
-                       "%s: Failed to register the network device\n",
+                       "%s: Failed to register the can network device\n",
                        MODULE_NAME);
-            goto out_register_dev;
+            goto out_unregister_devs;
         }
     }
 
@@ -803,15 +855,16 @@ ctem_init_module(void) {
 
     return 0;
 
-out_register_dev:
-    for (; registered_idx > 0; registered_idx--) {
+out_unregister_devs:
+    while (registered_idx-- > 0) {
         unregister_candev(ctem_devs[registered_idx]);
     }
-out_alloc_devs:
-    for (; allocate_idx > 0; allocate_idx--) {
+out_teardown_communications:
+    ctem_teardown_communications(ctem_communications);
+out_free_previous_devs:
+    while (allocate_idx-- > 0) {
         free_candev(ctem_devs[allocate_idx]);
     }
-    ctem_teardown_communications(ctem_communications);
     kfree(ctem_communications);
 out:
     return ret;

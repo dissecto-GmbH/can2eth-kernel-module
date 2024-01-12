@@ -1,7 +1,7 @@
 
 obj-m += canToEthMod.o
 
-CFLAGS = -Wall
+CFLAGS = -Wall -g
 ccflags-y += $(CFLAGS)
 
 all:
