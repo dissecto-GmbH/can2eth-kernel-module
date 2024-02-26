@@ -13,7 +13,7 @@
 #include <linux/socket.h>
 #include <linux/string.h>
 
-#define MODULE_NAME "CanToEth"
+#define MODULE_NAME "Can2Eth"
 
 #define CTEM_RX_BUFFER_SIZE 1500
 #define CTEM_TX_BUFFER_SIZE 1500
@@ -304,8 +304,9 @@ static int ctem_parse_frame(void *buf, size_t sz) {
 
   if (sz < size) {
     pr_err("%s: received datagram is shorter than what declared "
-           "in the can2eth header.\n",
-           MODULE_NAME);
+           "in the can2eth header. Declared was %hu, but only %lu bytes were "
+           "received\n",
+           MODULE_NAME, size, sz);
     return -3;
   }
 
@@ -326,8 +327,9 @@ static int ctem_parse_frame(void *buf, size_t sz) {
     sz -= 4;
     buf += 4;
     if (sz < chunk_size) {
-      pr_err("%s: a chunk in the received datagram is cut short. %lu %u\n",
-             MODULE_NAME, sz, chunk_size);
+      pr_err("%s: a chunk in the received datagram is cut short. Tried to read "
+             "%u bytes, but could only find %lu bytes\n",
+             MODULE_NAME, chunk_size, sz);
       return -5;
     }
 
