@@ -61,7 +61,6 @@ struct ctem_comm_handler {
   struct sockaddr **dest_addrs;
   int num_addrs;
   uint16_t last_seqno;
-  struct workqueue_struct *workqueue;
   struct ctem_pktbuilder *pktbuilder;
   struct task_struct *reception_thread;
   struct task_struct *transmission_thread;
@@ -102,13 +101,6 @@ struct ctem_priv {
   struct can_rx_offload offload;
   struct mutex rx_mutex;
   size_t if_idx;
-};
-
-struct ctem_reception_work {
-  struct work_struct work;
-  struct ctem_comm_handler *handler;
-  unsigned char *buffer;
-  size_t size;
 };
 
 static int internal_msgbuilder_flush(struct ctem_comm_handler *handler) {
@@ -304,13 +296,14 @@ static int ctem_parse_frame(void *buf, size_t sz) {
 
   if (sz < size) {
     pr_err("%s: received datagram is shorter than what declared "
-           "in the can2eth header. Declared was %hu, but only %lu bytes were "
+           "in the can2eth header. Declared were %hu bytes, but only %lu bytes "
+           "were "
            "received\n",
            MODULE_NAME, size, sz);
     return -3;
   }
 
-  if (hdr->seqno > ctem_communications->last_seqno + 1) {
+  if (hdr->seqno != ctem_communications->last_seqno + 1) {
     pr_warn("%s: Jump in sequence numbers detected. Went from %hu to %hu\n",
             MODULE_NAME, ctem_communications->last_seqno, hdr->seqno);
   }
@@ -432,31 +425,21 @@ static int ctem_parse_frame(void *buf, size_t sz) {
   return NET_RX_SUCCESS;
 }
 
-static void ctem_reception_work_function(struct work_struct *work) {
-  struct ctem_reception_work *ctem_work =
-      container_of(work, struct ctem_reception_work, work);
-
-  ctem_parse_frame((void *)ctem_work->buffer, ctem_work->size);
-
-  kfree(ctem_work->buffer);
-  kfree(ctem_work);
-}
-
 static int ctem_reception_thread(void *arg) {
   struct ctem_comm_handler *handler = (struct ctem_comm_handler *)arg;
+  unsigned char *receive_buffer = kmalloc(CTEM_RX_BUFFER_SIZE, GFP_KERNEL);
+
+  if (!receive_buffer) {
+    pr_err("%s: Failed to allocate reception buffer\n", MODULE_NAME);
+    return -1;
+  }
 
   pr_debug("%s: Started listing\n", MODULE_NAME);
 
   while (!kthread_should_stop()) {
     struct msghdr msg = {0};
     struct kvec iov;
-    unsigned char *receive_buffer = kmalloc(CTEM_RX_BUFFER_SIZE, GFP_KERNEL);
     int ret;
-
-    if (!receive_buffer) {
-      pr_err("%s: Failed to allocate reception buffer\n", MODULE_NAME);
-      continue;
-    }
 
     // set up iov struct
     iov.iov_base = receive_buffer;
@@ -467,21 +450,8 @@ static int ctem_reception_thread(void *arg) {
     if (ret < 0) {
       pr_err("%s: Error while listening to udp socket: %d\n", MODULE_NAME, ret);
     } else {
-      struct ctem_reception_work *work =
-          kmalloc(sizeof(struct ctem_reception_work), GFP_KERNEL);
 
-      if (!work) {
-        pr_err("%s: Failed to allocate work\n", MODULE_NAME);
-        kfree(receive_buffer);
-        continue;
-      }
-
-      work->handler = handler;
-      work->buffer = receive_buffer;
-      work->size = ret;
-
-      INIT_WORK(&work->work, ctem_reception_work_function);
-      queue_work(handler->workqueue, &work->work);
+      ctem_parse_frame(receive_buffer, ret);
 
       pr_debug("%s: Received %d Bytes.\n", MODULE_NAME, ret);
     }
@@ -611,12 +581,6 @@ int ctem_setup_communications(struct ctem_comm_handler *handler, int src_port,
 
   ret = msgbuilder_init(handler);
 
-  handler->workqueue = create_singlethread_workqueue("ctem_rx_workqueue");
-  if (!handler->workqueue) {
-    pr_err("%s: Failed to create workqueue\n", MODULE_NAME);
-    return -ENOMEM;
-  }
-
   handler->reception_thread =
       kthread_create(ctem_reception_thread, handler, "ctem_reception_thread");
   if (IS_ERR(handler->reception_thread)) {
@@ -634,8 +598,6 @@ void ctem_teardown_communications(struct ctem_comm_handler *handler) {
   if (handler->transmission_thread)
     (void)kthread_stop(handler->transmission_thread);
 
-  flush_workqueue(handler->workqueue);
-
   if (handler->udp_socket)
     sock_release(handler->udp_socket);
 
@@ -643,8 +605,6 @@ void ctem_teardown_communications(struct ctem_comm_handler *handler) {
     if (handler->dest_addrs[i])
       kfree(handler->dest_addrs[i]);
   }
-
-  destroy_workqueue(handler->workqueue);
 }
 
 void ctem_start_communications(struct ctem_comm_handler *handler) {
@@ -699,9 +659,9 @@ static netdev_tx_t ctem_xmit(struct sk_buff *skb, struct net_device *dev) {
   struct timespec64 ts;
   struct ctem_priv *priv = netdev_priv(dev);
 
-  memset(&frame, 0, sizeof(struct can2eth_can_chunk));
-
   ktime_get_boottime_ts64(&ts);
+
+  memset(&frame, 0, sizeof(struct can2eth_can_chunk));
 
   if (skb->len > CAN_MTU) {
     /* Handle canfd */
