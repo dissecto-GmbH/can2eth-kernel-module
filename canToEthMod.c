@@ -1,3 +1,42 @@
+/*
+Valid-License-Identifier: BSD-3-Clause
+SPDX-URL: https://spdx.org/licenses/BSD-3-Clause.html
+Usage-Guide:
+  To use the BSD 3-clause "New" or "Revised" License put the following SPDX
+  tag/value pair into a comment according to the placement guidelines in
+  the licensing rules documentation:
+    SPDX-License-Identifier: BSD-3-Clause
+License-Text:
+
+Copyright (c) <year> <owner> . All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from this
+   software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+*/
+
 #include <linux/can.h>
 #include <linux/can/dev.h>
 #include <linux/can/rx-offload.h>
@@ -159,20 +198,21 @@ int msgbuilder_enqueue(struct ctem_comm_handler *handler, void *data,
                        uint16_t len, uint16_t ctype) {
 
   pktbuilder_t *pkt_builder = handler->pktbuilder;
-  int result = -1;
+  int result = -1, r;
+  uint16_t chunksize, chunktype;
 
   spin_lock(&pkt_builder->mutex);
 
   if (pkt_builder->pos + len + 4 > CTEM_TX_BUFFER_SIZE) {
-    int r = internal_msgbuilder_flush(handler);
+    r = internal_msgbuilder_flush(handler);
     if (r < 0) {
       result = -3;
     }
   }
 
   if (pkt_builder->pos + len + 4 <= CTEM_TX_BUFFER_SIZE) {
-    uint16_t chunksize = htons(len);
-    uint16_t chunktype = htons(ctype);
+    chunksize = htons(len);
+    chunktype = htons(ctype);
     memcpy(pkt_builder->buf + pkt_builder->pos, &chunksize, sizeof(chunksize));
     pkt_builder->pos += 2;
     memcpy(pkt_builder->buf + pkt_builder->pos, &chunktype, sizeof(chunksize));
@@ -230,18 +270,18 @@ static int ctem_send_packet(struct ctem_comm_handler *handler, void *data,
 static int ctem_transmission_thread(void *arg) {
   struct ctem_comm_handler *handler = (struct ctem_comm_handler *)arg;
   static struct timespec64 last_ka = {0};
+  struct timespec64 now;
 
   pr_debug("%s: start transmission thread\n", MODULE_NAME);
 
   while (!kthread_should_stop()) {
-    struct timespec64 now;
 
     usleep_range(CTEM_MIN_TIMEOUT_CHECK, CTEM_MAX_TIMEOUT_CHECK);
     msgbuilder_flush_if_it_is_time(handler);
 
     ktime_get_real_ts64(&now);
     if (timespec64_sub(now, last_ka).tv_sec >= 1) {
-      struct stats_and_keepalive_chunk statchunk;
+      // struct stats_and_keepalive_chunk statchunk;
       last_ka = now;
       // msgbuilder_enqueue(handler, &statchunk, sizeof(statchunk),
       // MAGIC_KEEP_ALIVE);
@@ -281,6 +321,7 @@ static int ctem_parse_frame(void *buf, size_t sz) {
   struct timespec64 hdr_ts;
   struct can2eth_pkthdr *hdr = (struct can2eth_pkthdr *)buf;
   int16_t size = htons(hdr->size);
+  uint16_t chunk_size, chunk_type;
 
   if (sz < sizeof(struct can2eth_pkthdr)) {
     pr_err("%s: received datagram was too short to be a can2eth packet.\n",
@@ -315,8 +356,8 @@ static int ctem_parse_frame(void *buf, size_t sz) {
   sz -= sizeof(struct can2eth_pkthdr);
 
   for (unsigned chunk_idx = 0; sz > 4; chunk_idx++) {
-    uint16_t chunk_size = htons(((uint16_t *)buf)[0]);
-    uint16_t chunk_type = htons(((uint16_t *)buf)[1]);
+    chunk_size = htons(((uint16_t *)buf)[0]);
+    chunk_type = htons(((uint16_t *)buf)[1]);
     sz -= 4;
     buf += 4;
     if (sz < chunk_size) {
@@ -428,6 +469,9 @@ static int ctem_parse_frame(void *buf, size_t sz) {
 static int ctem_reception_thread(void *arg) {
   struct ctem_comm_handler *handler = (struct ctem_comm_handler *)arg;
   unsigned char *receive_buffer = kmalloc(CTEM_RX_BUFFER_SIZE, GFP_KERNEL);
+  int ret;
+  struct kvec iov;
+  struct msghdr msg;
 
   if (!receive_buffer) {
     pr_err("%s: Failed to allocate reception buffer\n", MODULE_NAME);
@@ -437,9 +481,7 @@ static int ctem_reception_thread(void *arg) {
   pr_debug("%s: Started listing\n", MODULE_NAME);
 
   while (!kthread_should_stop()) {
-    struct msghdr msg = {0};
-    struct kvec iov;
-    int ret;
+    memset(&msg, 0, sizeof(struct msghdr));
 
     // set up iov struct
     iov.iov_base = receive_buffer;
@@ -450,13 +492,12 @@ static int ctem_reception_thread(void *arg) {
     if (ret < 0) {
       pr_err("%s: Error while listening to udp socket: %d\n", MODULE_NAME, ret);
     } else {
-
       ctem_parse_frame(receive_buffer, ret);
-
       pr_debug("%s: Received %d Bytes.\n", MODULE_NAME, ret);
     }
   }
 
+  kfree(receive_buffer);
   pr_debug("%s: Stopped listing\n", MODULE_NAME);
   return 0;
 }
@@ -464,7 +505,6 @@ static int ctem_reception_thread(void *arg) {
 int ctem_setup_udp(struct ctem_comm_handler *handler, int src_port) {
   struct sockaddr *src_addr;
   int ret;
-
   struct sockaddr_in *udp_addr =
       kmalloc(sizeof(struct sockaddr_in), GFP_KERNEL);
 
