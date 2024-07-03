@@ -30,8 +30,11 @@
 #define NUM_ADDRESSES 10
 #define NUM_INTERFACES 2
 
-/*	this is the interval between checks for timeouts in the msgbuilder; since it
-	uses usleep_range, a lower and upper limit have to be provided in microseconds */
+/*
+ * this is the interval between checks for timeouts in the msgbuilder; since it
+ * uses usleep_range, a lower and upper limit have to be provided in
+ * microseconds.
+ */
 #define CTEM_MIN_TIMEOUT_CHECK 900
 #define CTEM_MAX_TIMEOUT_CHECK 1100
 
@@ -76,7 +79,7 @@ struct can2eth_can_chunk {
 	u8 len; /* frame payload length in byte (0 .. 64) */
 	u8 flags; /* additional flags for CAN FD */
 	u8 data[64] __attribute__((aligned(8)));
-};
+} __attribute__((packed));
 
 struct stats_and_keepalive_chunk {
 	unsigned int total_frames_relayed;
@@ -101,12 +104,8 @@ static int num_ip_addrs = 0; /* the actual number of ip address provided */
 static int port = 8765;
 static unsigned int timeout_ns = 10000000;
 
-module_param_array(ip_addrs, charp, &num_ip_addrs, 0000);
-module_param(port, int, S_IRUGO);
-module_param(timeout_ns, uint, S_IRUGO);
-
-struct ctem_comm_handler *ctem_communications;
-struct net_device *ctem_devs[NUM_INTERFACES];
+static struct ctem_comm_handler *ctem_communications;
+static struct net_device *ctem_devs[NUM_INTERFACES];
 
 static int internal_msgbuilder_flush(struct ctem_comm_handler *handler)
 {
@@ -172,13 +171,14 @@ static int msgbuilder_enqueue(struct ctem_comm_handler *handler, void *data,
 
 	spin_lock(&pkt_builder->mutex);
 
-	/* Checks if there is enough space left in the buffer for the frame
-         * with size len and the two 2 Byte fields chunksize and chunktype */
+	/*
+	 * Checks if there is enough space left in the buffer for the frame
+	 * with size len and the two 2 Byte fields chunksize and chunktype
+	 */
 	if (pkt_builder->pos + len + 4 > CTEM_TX_BUFFER_SIZE) {
 		ret = internal_msgbuilder_flush(handler);
-		if (ret < 0) {
+		if (ret < 0)
 			return ret;
-		}
 	}
 
 	if (pkt_builder->pos + len + 4 <= CTEM_TX_BUFFER_SIZE) {
@@ -193,13 +193,11 @@ static int msgbuilder_enqueue(struct ctem_comm_handler *handler, void *data,
 		memcpy(pkt_builder->buf + pkt_builder->pos, data, len);
 		pkt_builder->pos += len;
 		pkt_builder->empty = false;
-		ret = 0;
 	}
 
 	spin_unlock(&pkt_builder->mutex);
 
-	ret = msgbuilder_flush_if_it_is_time(handler);
-	return ret;
+	return msgbuilder_flush_if_it_is_time(handler);
 }
 
 static int ctem_send_packet(struct ctem_comm_handler *handler, void *data,
@@ -379,6 +377,7 @@ static int ctem_parse_frame(void *buf, size_t sz)
 	struct can2eth_pkthdr *hdr = (struct can2eth_pkthdr *)buf;
 	u16 size = htons(hdr->size);
 	u16 chunk_size, chunk_type;
+	unsigned chunk_idx;
 	int ret;
 
 	if (sz < sizeof(struct can2eth_pkthdr)) {
@@ -415,16 +414,18 @@ static int ctem_parse_frame(void *buf, size_t sz)
 	buf += sizeof(struct can2eth_pkthdr);
 	sz -= sizeof(struct can2eth_pkthdr);
 
-	for (unsigned chunk_idx = 0; sz > 4; chunk_idx++) {
+	for (chunk_idx = 0; sz > 4; chunk_idx++) {
+		/* read chunk size and type, and advance buf to the actual start of the chunk */
 		chunk_size = htons(((u16 *)buf)[0]);
 		chunk_type = htons(((u16 *)buf)[1]);
 		sz -= 4;
 		buf += 4;
+
 		if (sz < chunk_size) {
 			pr_err("%s: a chunk in the received datagram is cut short. Tried to read "
 			       "%u bytes, but could only find %lu bytes\n",
 			       MODULE_NAME, chunk_size, sz);
-			return -5;
+			return -EINVAL;
 		}
 
 		if (chunk_type == MAGIC_PACKET)
@@ -449,12 +450,12 @@ static int ctem_parse_frame(void *buf, size_t sz)
 static int ctem_reception_thread(void *arg)
 {
 	struct ctem_comm_handler *handler = (struct ctem_comm_handler *)arg;
-	unsigned char *receive_buffer =
-		kmalloc(CTEM_RX_BUFFER_SIZE, GFP_KERNEL);
-	int ret;
-	struct kvec iov;
+	unsigned char *receive_buffer;
 	struct msghdr msg;
+	struct kvec iov;
+	int ret;
 
+	receive_buffer = kmalloc(CTEM_RX_BUFFER_SIZE, GFP_KERNEL);
 	if (!receive_buffer) {
 		pr_err("%s: Failed to allocate reception buffer\n",
 		       MODULE_NAME);
@@ -517,12 +518,13 @@ int ctem_setup_udp(struct ctem_comm_handler *handler, int src_port)
 		return ret;
 	}
 
+        kfree(udp_addr);
+
 	return 0;
 }
 
 int parse_ip_port(const char *addr_port_str, u32 *ip_out, u16 *port_out)
 {
-	// Gibt's da nix von Ratiopharm, was das erledigt für dich?
 	char ip_str[16];
 	int ret;
 	char *colon = strchr(addr_port_str, ':');
@@ -623,7 +625,7 @@ int ctem_setup_communications(struct ctem_comm_handler *handler, int src_port,
 
 static int ctem_teardown_communications(struct ctem_comm_handler *handler)
 {
-	int ret;
+	int ret, i;
 
 	if (handler->reception_thread) {
 		ret = kthread_stop(handler->reception_thread);
@@ -646,7 +648,7 @@ static int ctem_teardown_communications(struct ctem_comm_handler *handler)
 	if (handler->udp_socket)
 		sock_release(handler->udp_socket);
 
-	for (int i = 0; i < handler->num_addrs; i++) {
+	for (i = 0; i < handler->num_addrs; i++) {
 		if (handler->dest_addrs[i])
 			kfree(handler->dest_addrs[i]);
 	}
@@ -810,9 +812,11 @@ static int ctem_init(struct net_device *dev, size_t if_idx)
 
 static __exit void ctem_cleanup_module(void)
 {
+	unsigned int i;
+
 	pr_debug("%s: Starting cleanup of CAN to Eth Driver\n", MODULE_NAME);
 
-	for (unsigned int i = 0; i < NUM_INTERFACES; i++) {
+	for (i = 0; i < NUM_INTERFACES; i++) {
 		if (ctem_devs[i]) {
 			unregister_candev(ctem_devs[i]);
 			free_candev(ctem_devs[i]);
@@ -834,9 +838,8 @@ static __init int ctem_init_module(void)
 
 	ctem_communications = (struct ctem_comm_handler *)kmalloc(
 		sizeof(struct ctem_comm_handler), GFP_KERNEL);
-
 	if (!ctem_communications)
-		goto out;
+		return -ENOMEM;
 
 	/* Initialize can interfaces */
 	for (allocate_idx = 0; allocate_idx < NUM_INTERFACES; allocate_idx++) {
