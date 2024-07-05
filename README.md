@@ -89,9 +89,9 @@ The header of a UDP frame contains the following information:
 
 After the header, the data follows.
 There are three kinds of data chunks that can appear in the data section:
-1. "normal" CAN frames - 0xc0fe
-2. keep alive frames - 0x57a7
-3. error frames - 0xfa11
+1. CAN/CAN FD frames - 0xc0fe
+2. keep alive frames - 0x57a7 (currently not supported)
+3. error frames - 0xfa11 (currently not supported)
 
 Each chunk is prefixed by its type and size,
 | Bytes | Name      | Description |
@@ -99,7 +99,9 @@ Each chunk is prefixed by its type and size,
 |   2   | Chunk Size | Chunk size, excluding the size for this and chunk type |
 |   2   | Chunk Type | Type, see above |
 
-followed by it's actual data
+followed by it's actual data.
+
+### CAN/CAN FD - Frames (0xc0fe)
 | Bytes | Name      | Description |
 |-------|-----------|-------------|
 |   8   | Timestamp | Timestamp in c `struct timespec` format:<br>- First 4 bytes: seconds since boot, big-endian<br>- Second 4 bytes: nanoseconds in this second (0-1000000000), big-endian |
