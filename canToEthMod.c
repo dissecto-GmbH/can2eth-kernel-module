@@ -26,6 +26,7 @@
 #define MAGIC_NUMBER 0x43324547 /* C2EG */
 #define MAGIC_PACKET 0xc0fe
 #define MAGIC_KEEP_ALIVE 0x57a7
+#define MAGIC_ERROR 0xfa11
 
 #define NUM_ADDRESSES 10
 #define NUM_INTERFACES 2
@@ -103,6 +104,10 @@ static char *ip_addrs[NUM_ADDRESSES];
 static int num_ip_addrs = 0; /* the actual number of ip address provided */
 static int port = 8765;
 static unsigned int timeout_ns = 10000000;
+
+module_param_array(ip_addrs, charp, &num_ip_addrs, 0000);
+module_param(port, int, S_IRUGO);
+module_param(timeout_ns, uint, S_IRUGO);
 
 static struct ctem_comm_handler *ctem_communications;
 static struct net_device *ctem_devs[NUM_INTERFACES];
@@ -518,7 +523,7 @@ int ctem_setup_udp(struct ctem_comm_handler *handler, int src_port)
 		return ret;
 	}
 
-        kfree(udp_addr);
+	kfree(udp_addr);
 
 	return 0;
 }
