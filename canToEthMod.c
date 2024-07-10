@@ -63,22 +63,41 @@ struct ctem_comm_handler {
 	struct task_struct *transmission_thread;
 };
 
+/**
+ * struct can2eth_pkthdr - header of a can2eth frame
+ * @magic: magic number of can2eth frames, "C2EG"
+ * @tv_sec: tv_sec part of a c timespec struct
+ * @tv_nsec: tv_nsec part of a c timespec struct
+ * @seqno: sequence number of the frame
+ * @size: size of the frame in bytes
+ */
 struct can2eth_pkthdr {
-	u32 magic;
-	u32 tv_sec;
-	u32 tv_nsec;
-	u16 seqno;
-	u16 size;
+	__be32 magic;
+	__be32 tv_sec;
+	__be32 tv_nsec;
+	__be16 seqno;
+	__be16 size;
 };
 
+/**
+ * struct can2eth_can_chunk - CAN frame in can2eth format
+ * @tv_sec: tv_sec part of a c timespec struct
+ * @tv_nsec: tv_nsec part of a c timespec struct
+ * @can_id: 32 bit CAN_ID
+ * @interface_idx: index of the source CAN-Interface the frame originates from
+ * @reserved: reserved for future use
+ * @len: length of the CAN-frame payload
+ * @flags: additional flags for CAN FD
+ * @data: CAN payload
+ */
 struct can2eth_can_chunk {
 	u32 tv_sec;
 	u32 tv_nsec;
-	u32 can_id; /* 32 bit CAN_ID + EFF/RTR/ERR flags */
+	u32 can_id;
 	u8 interface_idx;
 	u8 reserved;
-	u8 len; /* frame payload length in byte (0 .. 64) */
-	u8 flags; /* additional flags for CAN FD */
+	u8 len;
+	u8 flags;
 	u8 data[64] __attribute__((aligned(8)));
 } __attribute__((packed));
 
@@ -177,9 +196,9 @@ static int msgbuilder_enqueue(struct ctem_comm_handler *handler, void *data,
 	spin_lock(&pkt_builder->mutex);
 
 	/*
-	 * Checks if there is enough space left in the buffer for the frame
-	 * with size len and the two 2 Byte fields chunksize and chunktype
-	 */
+         * Checks if there is enough space left in the buffer for the frame
+         * with size len and the two 2 Byte fields chunksize and chunktype
+         */
 	if (pkt_builder->pos + len + 4 > CTEM_TX_BUFFER_SIZE) {
 		ret = internal_msgbuilder_flush(handler);
 		if (ret < 0)
@@ -406,7 +425,7 @@ static int ctem_parse_frame(void *buf, size_t sz)
 		return -EINVAL;
 	}
 
-	if (hdr->seqno != ctem_communications->last_seqno + 1) {
+	if (htons(hdr->seqno) != ctem_communications->last_seqno + 1) {
 		pr_warn("%s: Jump in sequence numbers detected. Went from %hu to %hu\n",
 			MODULE_NAME, ctem_communications->last_seqno,
 			hdr->seqno);
@@ -420,7 +439,8 @@ static int ctem_parse_frame(void *buf, size_t sz)
 	sz -= sizeof(struct can2eth_pkthdr);
 
 	for (chunk_idx = 0; sz > 4; chunk_idx++) {
-		/* read chunk size and type, and advance buf to the actual start of the chunk */
+		/* read chunk size and type, and advance buf to the actual start of the
+     * chunk */
 		chunk_size = htons(((u16 *)buf)[0]);
 		chunk_type = htons(((u16 *)buf)[1]);
 		sz -= 4;
@@ -897,7 +917,6 @@ out_free_previous_devs:
 		free_candev(ctem_devs[allocate_idx]);
 	}
 	kfree(ctem_communications);
-out:
 	return ret;
 }
 
